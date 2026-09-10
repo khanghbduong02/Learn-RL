@@ -45,9 +45,10 @@ class PhysicallyGroundedHumanoidWrapper(gym.Wrapper):
     """
 
     def __init__(self, env, min_height=0.5, max_speed_cap=10.0,
-                 power_weight=0.01, cot_bonus_weight=0.05,
-                 slip_weight=0.02, smoothness_weight=0.02,
-                 alive_bonus=1.0):
+                 power_weight=0.002, cot_bonus_weight=0.05,
+                 slip_weight=0.002, smoothness_weight=0.01,
+                 alive_bonus=0.3, min_moving_speed=0.5,
+                 max_power_cost=1.0, max_slip_cost=1.0):
         super().__init__(env)
         self.min_height = min_height
         self.max_speed_cap = max_speed_cap
@@ -56,6 +57,9 @@ class PhysicallyGroundedHumanoidWrapper(gym.Wrapper):
         self.slip_weight = slip_weight
         self.smoothness_weight = smoothness_weight
         self.alive_bonus = alive_bonus
+        self.min_moving_speed = min_moving_speed
+        self.max_power_cost = max_power_cost
+        self.max_slip_cost = max_slip_cost
         self._prev_action = None
         self._total_mass = None  # cached on first step
 
@@ -133,18 +137,23 @@ class PhysicallyGroundedHumanoidWrapper(gym.Wrapper):
         # --- Mechanical power & Cost of Transport ---
         power = self._mechanical_power(data)
         mass = self._get_total_mass(model)
-        # Guard against division blowup at near-zero velocity.
-        safe_speed = max(abs(forward_velocity), 0.3)
-        cot = power / (mass * GRAVITY * safe_speed)
-        # Reward LOW cost of transport (efficient locomotion), scaled down
-        # since CoT can be a large number early in training when movement
-        # is erratic and inefficient.
-        cot_bonus = self.cot_bonus_weight / (1.0 + cot)
 
-        power_cost = self.power_weight * power
+        if abs(forward_velocity) >= self.min_moving_speed:
+            # Only reward efficiency when the robot is actually displacing
+            # itself. Below this threshold, CoT is physically meaningless
+            # (doing work while going nowhere is NOT efficient -- it should
+            # never be rewarded, which is why we don't compute a "floored"
+            # CoT bonus for near-zero velocity like the previous version did).
+            cot = power / (mass * GRAVITY * abs(forward_velocity))
+            cot_bonus = self.cot_bonus_weight / (1.0 + cot)
+        else:
+            cot = float("inf")
+            cot_bonus = 0.0
+
+        power_cost = min(self.power_weight * power, self.max_power_cost)
 
         # --- Friction / slip energy loss ---
-        slip_cost = self.slip_weight * self._friction_slip_loss(model, data)
+        slip_cost = min(self.slip_weight * self._friction_slip_loss(model, data), self.max_slip_cost)
 
         # --- Smoothness (guards against actuator-buzzing exploits) ---
         if self._prev_action is None:
@@ -271,6 +280,98 @@ def main():
             os.remove(custom_target_file)
         os.rename(generic_saved_file, custom_target_file)
         print(f"Saved model as: '{custom_target_file}'")
+
+    # ------------------------------------------------------------------
+    # Visualization / testing: watch the trained policy AND see the real
+    # physics numbers (power, Cost of Transport, slip loss) it achieves,
+    # not just the visual gait.
+    # ------------------------------------------------------------------
+    run_visual_test(best_model_path, vecnorm_path, n_episodes=3)
+
+
+def run_visual_test(best_model_path, stats_path, n_episodes=3):
+    print("\nLaunching 3D window to watch the trained agent run...")
+    env_id = "Humanoid-v5"
+
+    base_env = gym.make(
+        env_id,
+        render_mode="human",
+        healthy_z_range=(0.0, float("inf")),
+        terminate_when_unhealthy=False,
+    )
+    try:
+        base_env.unwrapped.model.geom_size[0, :] = [1000.0, 1000.0, 1.0]
+    except Exception:
+        pass
+
+    wrapped_env = PhysicallyGroundedHumanoidWrapper(base_env, min_height=0.5)
+    vec_env = DummyVecEnv([lambda: wrapped_env])
+
+    if os.path.exists(stats_path):
+        vec_env = VecNormalize.load(stats_path, vec_env)
+        vec_env.training = False
+        vec_env.norm_reward = False
+    else:
+        print("Warning: VecNormalize stats not found -- observations will be unnormalized "
+              "and the policy will likely behave incorrectly.")
+
+    model = SAC.load(best_model_path, env=vec_env, device="cuda")
+
+    all_episode_stats = []
+    obs = vec_env.reset()
+    try:
+        for episode in range(n_episodes):
+            print(f"\n=== Episode {episode + 1} ===")
+            done = False
+            step_count = 0
+            velocities, powers, cots, slips = [], [], [], []
+
+            while not done:
+                action, _states = model.predict(obs, deterministic=True)
+                try:
+                    obs, reward, done_arr, info = vec_env.step(action)
+                    done = bool(done_arr[0])
+                except Exception:
+                    return
+                step_count += 1
+
+                velocities.append(info[0].get("forward_velocity", 0.0))
+                powers.append(info[0].get("mechanical_power_w", 0.0))
+                cots.append(info[0].get("cost_of_transport", 0.0))
+                slips.append(info[0].get("slip_cost", 0.0))
+
+                time.sleep(1.0 / 60.0)
+
+                if done:
+                    avg_v = float(np.mean(velocities))
+                    avg_power = float(np.mean(powers))
+                    finite_cots = [c for c in cots if np.isfinite(c)]
+                    avg_cot = float(np.mean(finite_cots)) if finite_cots else float("inf")
+                    pct_moving = 100.0 * len(finite_cots) / max(len(cots), 1)
+                    avg_slip = float(np.mean(slips))
+                    print(f"Steps survived: {step_count}")
+                    print(f"Avg forward velocity: {avg_v:.2f} m/s")
+                    print(f"Avg mechanical power: {avg_power:.1f} W")
+                    print(f"Avg cost of transport (while moving, {pct_moving:.0f}% of steps): {avg_cot:.3f}")
+                    print(f"Avg slip-loss term: {avg_slip:.4f}")
+                    all_episode_stats.append((step_count, avg_v, avg_power, avg_cot, avg_slip))
+                    time.sleep(1.5)
+
+            obs = vec_env.reset()
+    finally:
+        try:
+            vec_env.close()
+        except Exception:
+            pass
+
+    if all_episode_stats:
+        steps, vs, pws, cots, slips = zip(*all_episode_stats)
+        print("\n=== Summary across all episodes ===")
+        print(f"Mean steps survived: {np.mean(steps):.0f}")
+        print(f"Mean velocity:       {np.mean(vs):.2f} m/s")
+        print(f"Mean power:          {np.mean(pws):.1f} W")
+        print(f"Mean cost of transport: {np.mean(cots):.3f}")
+        print(f"Mean slip-loss:      {np.mean(slips):.4f}")
 
 
 if __name__ == "__main__":
