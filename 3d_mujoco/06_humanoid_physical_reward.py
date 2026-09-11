@@ -13,55 +13,72 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 
 GRAVITY = 9.81
 
+# ============================================================================
+# STAGE SELECTOR
+#   STAGE = 1: proven speed-only reward (matches the earlier run that
+#              successfully sustained 1000 steps at 3+ m/s). No power/CoT/
+#              friction terms -- those default to weight 0 below. Use this
+#              to (re)build a stable base gait from scratch.
+#   STAGE = 2: loads the Stage-1 checkpoint and CONTINUES training with
+#              small physics-efficiency weights turned on, so the agent
+#              refines an already-working gait instead of learning
+#              locomotion and efficiency simultaneously from scratch.
+# Run Stage 1 to completion first, confirm it still runs well via
+# run_visual_test, THEN switch this to 2 and rerun.
+# ============================================================================
+STAGE = 1
 
-class PhysicallyGroundedHumanoidWrapper(gym.Wrapper):
+TOTAL_STEPS_STAGE1 = 5_000_000
+TOTAL_STEPS_STAGE2 = 2_000_000  # fine-tuning needs far fewer steps
+
+
+class CurriculumHumanoidWrapper(gym.Wrapper):
     """
-    Speed-focused wrapper grounded in actual simulated physics rather than
-    hand-crafted gait shaping. No priors about "correct" posture or limb
-    coordination — the agent is free to discover whatever locomotion
-    strategy is fastest AND cheapest in real physical terms:
+    Unified reward wrapper used for both curriculum stages, so the
+    observation/action space and base reward structure never change
+    between stages -- only the efficiency-term weights differ. This lets
+    Stage 2 load the Stage-1 policy and fine-tune rather than relearn.
 
-      - forward velocity: the primary objective (bounded, not exponential).
-      - mechanical power (Watts): Power = sum(actuator_force * joint_vel)
-        across all DOFs, taken directly from MuJoCo's qfrc_actuator/qvel.
-        This is real instantaneous mechanical power, not a proxy.
-      - Cost of Transport (CoT) = Power / (mass * g * velocity), the
-        standard dimensionless efficiency metric used in real bipedal
-        robotics/biomechanics to compare gaits independent of body size
-        or speed. Lower is more efficient. We convert this into a reward
-        bonus for efficient locomotion.
-      - friction-slip energy loss: an APPROXIMATION of energy dissipated
-        to kinetic friction when a contacting body slides rather than
-        grips (foot dragging, knee-skating, etc). Computed from MuJoCo's
-        per-contact force decomposition x an estimated relative sliding
-        velocity at the contact site. This is deliberately conservative;
-        verify against your MuJoCo version before trusting the exact
-        magnitude — the goal is "discourage energy-wasting sliding
-        contact," not a lab-grade tribology model.
+    Base terms (always active, proven to produce sustained locomotion):
+      - speed_reward: bounded forward velocity.
+      - alive_bonus: flat per-step bonus.
+      - ctrl_cost: action-magnitude penalty (sum of squared actions),
+        NOT physical power -- this is the same cheap regularizer from the
+        version that worked.
+      - smoothness_cost: frame-to-frame action jerk penalty.
 
-    None of these terms encode what a "correct" gait looks like — they
-    encode what is/isn't physically expensive, which is exactly the
-    distinction you asked for.
+    Efficiency terms (weight 0 in Stage 1, small nonzero in Stage 2):
+      - power_cost: real mechanical power (qfrc_actuator * qvel), Watts.
+      - cot_bonus: Cost-of-Transport based efficiency bonus, only applied
+        above min_moving_speed (never rewards standing still).
+      - slip_cost: approximate friction-slip energy loss.
+
+    All costs use a SOFT cap (tanh saturation) rather than a hard min()
+    clip. A hard clip creates a flat zero-marginal-cost region once the
+    cap is hit -- which is exactly what caused the "flail with 900W of
+    torque because extra power is free past the cap" failure. tanh
+    saturation still asymptotically bounds the penalty but never fully
+    flattens the marginal incentive to reduce it further.
     """
 
-    def __init__(self, env, min_height=0.5, max_speed_cap=10.0,
-                 power_weight=0.002, cot_bonus_weight=0.05,
-                 slip_weight=0.002, smoothness_weight=0.01,
-                 alive_bonus=0.3, min_moving_speed=0.5,
-                 max_power_cost=1.0, max_slip_cost=1.0):
+    def __init__(self, env, min_height=0.7, max_speed_cap=10.0,
+                 alive_bonus=1.0, ctrl_cost_weight=0.05, smoothness_weight=0.02,
+                 power_weight=0.0, cot_bonus_weight=0.0, slip_weight=0.0,
+                 min_moving_speed=0.5, max_power_cost=1.0, max_slip_cost=1.0):
         super().__init__(env)
         self.min_height = min_height
         self.max_speed_cap = max_speed_cap
+        self.alive_bonus = alive_bonus
+        self.ctrl_cost_weight = ctrl_cost_weight
+        self.smoothness_weight = smoothness_weight
         self.power_weight = power_weight
         self.cot_bonus_weight = cot_bonus_weight
         self.slip_weight = slip_weight
-        self.smoothness_weight = smoothness_weight
-        self.alive_bonus = alive_bonus
         self.min_moving_speed = min_moving_speed
         self.max_power_cost = max_power_cost
         self.max_slip_cost = max_slip_cost
         self._prev_action = None
-        self._total_mass = None  # cached on first step
+        self._total_mass = None
 
     def reset(self, **kwargs):
         self._prev_action = None
@@ -73,20 +90,9 @@ class PhysicallyGroundedHumanoidWrapper(gym.Wrapper):
         return self._total_mass
 
     def _mechanical_power(self, data):
-        # Real instantaneous mechanical power delivered by actuators:
-        # sum over all DOFs of (generalized actuator force * joint velocity).
-        # qfrc_actuator has shape (nv,), same as qvel.
         return float(np.sum(np.abs(data.qfrc_actuator * data.qvel)))
 
     def _friction_slip_loss(self, model, data):
-        """
-        Approximate energy dissipated to sliding friction across all active
-        contacts this step. For each contact: tangential (friction) force
-        magnitude x approximate relative sliding speed at that contact.
-        Uses geom-frame velocity as a stand-in for exact contact-point
-        velocity (reasonable for small/capsule contact geoms like feet,
-        less exact for large flat contacts).
-        """
         total_slip_power = 0.0
         for i in range(data.ncon):
             contact = data.contact[i]
@@ -96,28 +102,28 @@ class PhysicallyGroundedHumanoidWrapper(gym.Wrapper):
                 tangential_force = np.linalg.norm(force6[1:3])
                 if tangential_force < 1e-6:
                     continue
-
-                # Approximate sliding speed via the two contacting geoms'
-                # body linear velocities projected onto the contact frame's
-                # tangent plane. This is an approximation, not an exact
-                # contact-point velocity.
                 geom1_body = model.geom_bodyid[contact.geom1]
                 geom2_body = model.geom_bodyid[contact.geom2]
                 v1 = data.cvel[geom1_body][3:6]
                 v2 = data.cvel[geom2_body][3:6]
                 rel_vel = v1 - v2
-
                 contact_frame = contact.frame.reshape(3, 3)
                 normal = contact_frame[0]
                 rel_vel_tangential = rel_vel - np.dot(rel_vel, normal) * normal
                 slip_speed = np.linalg.norm(rel_vel_tangential)
-
                 total_slip_power += tangential_force * slip_speed
             except Exception:
-                # Defensive: contact force API details can vary by MuJoCo
-                # version. Skip this contact rather than crash training.
                 continue
         return total_slip_power
+
+    @staticmethod
+    def _soft_cap(raw_cost, cap):
+        # Smooth saturation: bounded like a hard cap, but marginal cost
+        # never fully vanishes (derivative of tanh is never exactly 0),
+        # so there's no "extra effort is free past this point" region.
+        if cap <= 0:
+            return raw_cost
+        return cap * np.tanh(raw_cost / cap)
 
     def step(self, action):
         action = np.clip(action, -1.0, 1.0)
@@ -134,41 +140,42 @@ class PhysicallyGroundedHumanoidWrapper(gym.Wrapper):
         forward_velocity = data.qvel[0]
         speed_reward = np.clip(forward_velocity, -self.max_speed_cap, self.max_speed_cap)
 
-        # --- Mechanical power & Cost of Transport ---
-        power = self._mechanical_power(data)
-        mass = self._get_total_mass(model)
+        ctrl_cost = self.ctrl_cost_weight * np.sum(np.square(action))
 
-        if abs(forward_velocity) >= self.min_moving_speed:
-            # Only reward efficiency when the robot is actually displacing
-            # itself. Below this threshold, CoT is physically meaningless
-            # (doing work while going nowhere is NOT efficient -- it should
-            # never be rewarded, which is why we don't compute a "floored"
-            # CoT bonus for near-zero velocity like the previous version did).
-            cot = power / (mass * GRAVITY * abs(forward_velocity))
-            cot_bonus = self.cot_bonus_weight / (1.0 + cot)
-        else:
-            cot = float("inf")
-            cot_bonus = 0.0
-
-        power_cost = min(self.power_weight * power, self.max_power_cost)
-
-        # --- Friction / slip energy loss ---
-        slip_cost = min(self.slip_weight * self._friction_slip_loss(model, data), self.max_slip_cost)
-
-        # --- Smoothness (guards against actuator-buzzing exploits) ---
         if self._prev_action is None:
             smoothness_cost = 0.0
         else:
             smoothness_cost = self.smoothness_weight * np.sum(np.square(action - self._prev_action))
         self._prev_action = action
 
+        # --- Efficiency terms (inert at weight 0, i.e. Stage 1) ---
+        power = self._mechanical_power(data)
+        mass = self._get_total_mass(model)
+
+        if self.cot_bonus_weight > 0 and abs(forward_velocity) >= self.min_moving_speed:
+            cot = power / (mass * GRAVITY * abs(forward_velocity))
+            cot_bonus = self.cot_bonus_weight / (1.0 + cot)
+        else:
+            cot = float("inf")
+            cot_bonus = 0.0
+
+        power_cost = self._soft_cap(self.power_weight * power, self.max_power_cost) \
+            if self.power_weight > 0 else 0.0
+
+        if self.slip_weight > 0:
+            slip_raw = self._friction_slip_loss(model, data)
+            slip_cost = self._soft_cap(self.slip_weight * slip_raw, self.max_slip_cost)
+        else:
+            slip_cost = 0.0
+
         reward = (
             speed_reward
             + self.alive_bonus
             + cot_bonus
+            - ctrl_cost
+            - smoothness_cost
             - power_cost
             - slip_cost
-            - smoothness_cost
         )
         if fell:
             reward -= 10.0
@@ -185,46 +192,85 @@ class PhysicallyGroundedHumanoidWrapper(gym.Wrapper):
         return obs, float(reward), terminated, truncated, info
 
 
-def make_wrapped_env(env_id, min_height=0.5):
+def make_wrapped_env(env_id, wrapper_kwargs):
     def _init():
         env = gym.make(
             env_id,
             healthy_z_range=(0.0, float("inf")),
             terminate_when_unhealthy=False,
         )
-        return PhysicallyGroundedHumanoidWrapper(env, min_height=min_height)
+        return CurriculumHumanoidWrapper(env, **wrapper_kwargs)
     return _init
+
+
+def get_stage_kwargs(stage):
+    if stage == 1:
+        # Exactly the config that previously produced a sustained
+        # ~3+ m/s gait for the full 1000-step episode. Efficiency
+        # terms OFF.
+        return dict(
+            min_height=0.7,
+            alive_bonus=1.0,
+            ctrl_cost_weight=0.05,
+            smoothness_weight=0.02,
+            power_weight=0.0,
+            cot_bonus_weight=0.0,
+            slip_weight=0.0,
+        )
+    elif stage == 2:
+        # Same base config, efficiency terms turned on at SMALL weights.
+        # These are still guesses -- validate on a short run before
+        # trusting them, same as any new weight.
+        return dict(
+            min_height=0.7,
+            alive_bonus=1.0,
+            ctrl_cost_weight=0.05,
+            smoothness_weight=0.02,
+            power_weight=0.0005,
+            cot_bonus_weight=0.02,
+            slip_weight=0.0005,
+            max_power_cost=0.5,
+            max_slip_cost=0.5,
+        )
+    else:
+        raise ValueError(f"Unknown STAGE: {stage}")
 
 
 def main():
     env_id = "Humanoid-v5"
-    TOTAL_STEPS = 5_000_000
+    stage_kwargs = get_stage_kwargs(STAGE)
+    total_steps = TOTAL_STEPS_STAGE1 if STAGE == 1 else TOTAL_STEPS_STAGE2
 
     cpu_count = os.cpu_count() or 8
     N_ENVS = max(1, cpu_count - 2)
-    print(f"Detected {cpu_count} CPU threads -> using {N_ENVS} parallel envs.")
+    print(f"STAGE {STAGE} | Detected {cpu_count} CPU threads -> using {N_ENVS} parallel envs.")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     models_dir = os.path.abspath(os.path.join(script_dir, "..", "models"))
     os.makedirs(models_dir, exist_ok=True)
 
-    best_model_path = os.path.join(models_dir, "best_sac_mujoco_humanoid_physical")
-    vecnorm_path = os.path.join(models_dir, "vecnormalize.pkl")
-    checkpoint_dir = os.path.join(models_dir, "checkpoints")
+    stage1_model_path = os.path.join(models_dir, "sac_humanoid_stage1")
+    stage1_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage1.pkl")
+    stage2_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
+    stage2_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
+
+    best_model_path = stage1_model_path if STAGE == 1 else stage2_model_path
+    vecnorm_path = stage1_vecnorm_path if STAGE == 1 else stage2_vecnorm_path
+
+    checkpoint_dir = os.path.join(models_dir, f"checkpoints_stage{STAGE}")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    print("Initializing vectorized MuJoCo environments (physics-grounded reward)...")
-
+    print(f"Initializing vectorized MuJoCo environments (Stage {STAGE} reward)...")
     vec_env_cls = SubprocVecEnv if N_ENVS > 1 else DummyVecEnv
     train_env = make_vec_env(
-        make_wrapped_env(env_id, min_height=0.5),
+        make_wrapped_env(env_id, stage_kwargs),
         n_envs=N_ENVS,
         vec_env_cls=vec_env_cls,
     )
     train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
     eval_env = make_vec_env(
-        make_wrapped_env(env_id, min_height=0.5),
+        make_wrapped_env(env_id, stage_kwargs),
         n_envs=1,
         vec_env_cls=DummyVecEnv,
     )
@@ -241,32 +287,46 @@ def main():
     checkpoint_callback = CheckpointCallback(
         save_freq=max(100000 // N_ENVS, 1000),
         save_path=checkpoint_dir,
-        name_prefix="sac_humanoid_physical",
+        name_prefix=f"sac_humanoid_stage{STAGE}",
         save_vecnormalize=True,
     )
     callback = CallbackList([eval_callback, checkpoint_callback])
 
-    print("Setting up SAC on CUDA...")
     policy_kwargs = dict(net_arch=dict(pi=[512, 512], qf=[512, 512]))
 
-    model = SAC(
-        "MlpPolicy",
-        train_env,
-        verbose=1,
-        learning_rate=0.0003,
-        buffer_size=500000,
-        batch_size=256,
-        tau=0.005,
-        gamma=0.99,
-        ent_coef="auto",
-        use_sde=True,
-        sde_sample_freq=4,
-        policy_kwargs=policy_kwargs,
-        device="cuda",
-    )
+    if STAGE == 1:
+        print("Setting up fresh SAC model (Stage 1: speed-only) on CUDA...")
+        model = SAC(
+            "MlpPolicy",
+            train_env,
+            verbose=1,
+            learning_rate=0.0003,
+            buffer_size=500000,
+            batch_size=256,
+            tau=0.005,
+            gamma=0.99,
+            ent_coef="auto",
+            use_sde=True,
+            sde_sample_freq=4,
+            policy_kwargs=policy_kwargs,
+            device="cuda",
+        )
+    else:
+        print(f"Loading Stage-1 checkpoint from '{stage1_model_path}.zip' to continue training "
+              f"with efficiency terms enabled...")
+        if os.path.exists(stage1_vecnorm_path):
+            train_env = VecNormalize.load(stage1_vecnorm_path, train_env.venv)
+            train_env.training = True
+            train_env.norm_reward = True
+        model = SAC.load(f"{stage1_model_path}.zip", env=train_env, device="cuda")
+        # Re-enable exploration for fine-tuning -- Stage 1's entropy will
+        # have annealed down near zero by the end of training, which
+        # would otherwise prevent the policy from adapting to the new
+        # reward terms at all.
+        model.ent_coef = "auto"
 
-    print(f"Training for {TOTAL_STEPS:,} steps across {N_ENVS} parallel envs...")
-    model.learn(total_timesteps=TOTAL_STEPS, callback=callback)
+    print(f"Training Stage {STAGE} for {total_steps:,} steps across {N_ENVS} parallel envs...")
+    model.learn(total_timesteps=total_steps, callback=callback, reset_num_timesteps=(STAGE == 1))
 
     train_env.save(vecnorm_path)
     train_env.close()
@@ -274,22 +334,16 @@ def main():
 
     generic_saved_file = os.path.join(models_dir, "best_model.zip")
     custom_target_file = f"{best_model_path}.zip"
-
     if os.path.exists(generic_saved_file):
         if os.path.exists(custom_target_file):
             os.remove(custom_target_file)
         os.rename(generic_saved_file, custom_target_file)
         print(f"Saved model as: '{custom_target_file}'")
 
-    # ------------------------------------------------------------------
-    # Visualization / testing: watch the trained policy AND see the real
-    # physics numbers (power, Cost of Transport, slip loss) it achieves,
-    # not just the visual gait.
-    # ------------------------------------------------------------------
-    run_visual_test(best_model_path, vecnorm_path, n_episodes=3)
+    run_visual_test(best_model_path, vecnorm_path, stage_kwargs, n_episodes=3)
 
 
-def run_visual_test(best_model_path, stats_path, n_episodes=3):
+def run_visual_test(best_model_path, stats_path, wrapper_kwargs, n_episodes=3):
     print("\nLaunching 3D window to watch the trained agent run...")
     env_id = "Humanoid-v5"
 
@@ -304,7 +358,7 @@ def run_visual_test(best_model_path, stats_path, n_episodes=3):
     except Exception:
         pass
 
-    wrapped_env = PhysicallyGroundedHumanoidWrapper(base_env, min_height=0.5)
+    wrapped_env = CurriculumHumanoidWrapper(base_env, **wrapper_kwargs)
     vec_env = DummyVecEnv([lambda: wrapped_env])
 
     if os.path.exists(stats_path):
@@ -312,10 +366,9 @@ def run_visual_test(best_model_path, stats_path, n_episodes=3):
         vec_env.training = False
         vec_env.norm_reward = False
     else:
-        print("Warning: VecNormalize stats not found -- observations will be unnormalized "
-              "and the policy will likely behave incorrectly.")
+        print("Warning: VecNormalize stats not found -- observations will be unnormalized.")
 
-    model = SAC.load(best_model_path, env=vec_env, device="cuda")
+    model = SAC.load(f"{best_model_path}.zip", env=vec_env, device="cuda")
 
     all_episode_stats = []
     obs = vec_env.reset()
