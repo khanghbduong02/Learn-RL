@@ -168,12 +168,13 @@ MARATHONER_KWARGS = dict(
     alive_bonus=1.0,
     ctrl_cost_weight=0.05,
     smoothness_weight=0.02,
-    speed_weight=0.2,        # cut further -- speed_reward now maxes ~2.0
+    speed_weight=0.2,
     power_weight=0.0001,
-    cot_bonus_weight=1.5,    # ~10x increase -- now same order of magnitude
-                             # as speed_reward, so efficiency can actually
-                             # outweigh a speed gain rather than being
-                             # mathematically incapable of competing
+    cot_bonus_weight=3.0,    # doubled again from 1.5 -- last run got within
+                             # ~2.8% of the sprinter's CoT with cot_bonus
+                             # and speed_reward roughly at parity (~0.53
+                             # each); pushing further to see if efficiency
+                             # can outright win rather than tie
     slip_weight=0.001,
     max_power_cost=0.3,
     max_slip_cost=0.3,
