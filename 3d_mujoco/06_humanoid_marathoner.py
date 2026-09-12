@@ -148,6 +148,11 @@ class CurriculumHumanoidWrapper(gym.Wrapper):
         info["mechanical_power_w"] = float(power)
         info["cost_of_transport"] = float(cot)
         info["slip_cost"] = float(slip_cost)
+        info["speed_reward"] = float(speed_reward)
+        info["cot_bonus"] = float(cot_bonus)
+        info["power_cost"] = float(power_cost)
+        info["ctrl_cost"] = float(ctrl_cost)
+        info["smoothness_cost"] = float(smoothness_cost)
 
         return obs, float(reward), terminated, truncated, info
 
@@ -163,9 +168,12 @@ MARATHONER_KWARGS = dict(
     alive_bonus=1.0,
     ctrl_cost_weight=0.05,
     smoothness_weight=0.02,
-    speed_weight=0.5,        # de-emphasize raw velocity
-    power_weight=0.0001,     # rescaled: ~3000W raw power -> ~0.3 before cap
-    cot_bonus_weight=0.15,   # doubled: primary efficiency signal, strengthened
+    speed_weight=0.2,        # cut further -- speed_reward now maxes ~2.0
+    power_weight=0.0001,
+    cot_bonus_weight=1.5,    # ~10x increase -- now same order of magnitude
+                             # as speed_reward, so efficiency can actually
+                             # outweigh a speed gain rather than being
+                             # mathematically incapable of competing
     slip_weight=0.001,
     max_power_cost=0.3,
     max_slip_cost=0.3,
@@ -297,6 +305,7 @@ def run_visual_test(best_model_path, stats_path, wrapper_kwargs, n_episodes=3):
             done = False
             step_count = 0
             velocities, powers, cots, slips = [], [], [], []
+            speed_rewards, cot_bonuses, power_costs, ctrl_costs, smoothness_costs = [], [], [], [], []
 
             while not done:
                 action, _states = model.predict(obs, deterministic=True)
@@ -311,6 +320,11 @@ def run_visual_test(best_model_path, stats_path, wrapper_kwargs, n_episodes=3):
                 powers.append(info[0].get("mechanical_power_w", 0.0))
                 cots.append(info[0].get("cost_of_transport", 0.0))
                 slips.append(info[0].get("slip_cost", 0.0))
+                speed_rewards.append(info[0].get("speed_reward", 0.0))
+                cot_bonuses.append(info[0].get("cot_bonus", 0.0))
+                power_costs.append(info[0].get("power_cost", 0.0))
+                ctrl_costs.append(info[0].get("ctrl_cost", 0.0))
+                smoothness_costs.append(info[0].get("smoothness_cost", 0.0))
 
                 time.sleep(1.0 / 60.0)
 
@@ -326,6 +340,13 @@ def run_visual_test(best_model_path, stats_path, wrapper_kwargs, n_episodes=3):
                     print(f"Avg mechanical power: {avg_power:.1f} W")
                     print(f"Avg cost of transport (while moving, {pct_moving:.0f}% of steps): {avg_cot:.3f}")
                     print(f"Avg slip-loss term: {avg_slip:.4f}")
+                    print(f"--- Reward component magnitudes (avg per step) ---")
+                    print(f"  speed_reward:     {np.mean(speed_rewards):.3f}")
+                    print(f"  cot_bonus:        {np.mean(cot_bonuses):.4f}")
+                    print(f"  power_cost:       {np.mean(power_costs):.4f}")
+                    print(f"  slip_cost:        {avg_slip:.4f}")
+                    print(f"  ctrl_cost:        {np.mean(ctrl_costs):.4f}")
+                    print(f"  smoothness_cost:  {np.mean(smoothness_costs):.4f}")
                     all_episode_stats.append((step_count, avg_v, avg_power, avg_cot, avg_slip))
                     time.sleep(1.5)
 
