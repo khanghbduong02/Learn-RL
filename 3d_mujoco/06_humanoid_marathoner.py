@@ -153,16 +153,21 @@ class CurriculumHumanoidWrapper(gym.Wrapper):
 
 
 # Marathoner profile: efficiency dominates, speed is secondary.
+# NOTE: power_weight/max_power_cost recalibrated for the ~3000W power range
+# actually observed after curriculum fine-tuning (earlier values were tuned
+# against ~100-800W observed in prior stages and had silently saturated --
+# raw_cost/cap was ~10x, putting tanh in its near-zero-gradient region,
+# which gave almost no pressure to actually reduce power).
 MARATHONER_KWARGS = dict(
     min_height=0.7,
     alive_bonus=1.0,
     ctrl_cost_weight=0.05,
     smoothness_weight=0.02,
     speed_weight=0.5,        # de-emphasize raw velocity
-    power_weight=0.001,      # meaningfully penalize power draw
-    cot_bonus_weight=0.08,   # strong efficiency incentive
-    slip_weight=0.001,       # meaningfully penalize foot/knee slipping
-    max_power_cost=0.3,      # tighter cap -- forces genuinely low effort
+    power_weight=0.0001,     # rescaled: ~3000W raw power -> ~0.3 before cap
+    cot_bonus_weight=0.15,   # doubled: primary efficiency signal, strengthened
+    slip_weight=0.001,
+    max_power_cost=0.3,
     max_slip_cost=0.3,
 )
 
