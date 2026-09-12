@@ -26,7 +26,7 @@ GRAVITY = 9.81
 # Run Stage 1 to completion first, confirm it still runs well via
 # run_visual_test, THEN switch this to 2 and rerun.
 # ============================================================================
-STAGE = 1
+STAGE = 2
 
 TOTAL_STEPS_STAGE1 = 5_000_000
 TOTAL_STEPS_STAGE2 = 2_000_000  # fine-tuning needs far fewer steps
