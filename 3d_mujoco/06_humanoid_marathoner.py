@@ -170,19 +170,18 @@ MARATHONER_KWARGS = dict(
     smoothness_weight=0.02,
     speed_weight=0.2,
     power_weight=0.0001,
-    cot_bonus_weight=5.0,    # pushed further past 3.0 (v=1.67, 1.5% better
-                             # than sprinter) for max efficiency, speed
-                             # target abandoned. Expect diminishing returns
-                             # to continue -- 1.5->3.0 only moved CoT from
-                             # 2.8% worse to 1.5% better while roughly
-                             # halving speed, so further gains here will
-                             # likely be small. Note: cot_bonus is forced
-                             # to 0 below min_moving_speed=0.5 m/s, so there
-                             # is a structural floor -- the agent has no
-                             # efficiency incentive to slow below that
-                             # threshold, which should prevent a full
-                             # collapse back to the earlier "stand still"
-                             # exploit even at this weight.
+    cot_bonus_weight=9.0,    # pushed from 5.0 (v=1.44, CoT=1.21) -- no
+                             # plateau observed yet (velocity still well
+                             # above the min_moving_speed=0.5 floor), so
+                             # continuing the push rather than locking in.
+                             # Watch for: (a) velocity approaching 0.5,
+                             # where cot_bonus goes to a hard 0 -- this
+                             # threshold is a step function, not smooth, so
+                             # behavior near it could get unstable/oscillate
+                             # rather than settle cleanly; (b) CoT actually
+                             # getting WORSE despite the higher weight,
+                             # which would mean the floor was between 5.0
+                             # and 9.0 and this overshot it.
     slip_weight=0.001,
     max_power_cost=0.3,
     max_slip_cost=0.3,
