@@ -170,11 +170,19 @@ MARATHONER_KWARGS = dict(
     smoothness_weight=0.02,
     speed_weight=0.2,
     power_weight=0.0001,
-    cot_bonus_weight=3.0,    # doubled again from 1.5 -- last run got within
-                             # ~2.8% of the sprinter's CoT with cot_bonus
-                             # and speed_reward roughly at parity (~0.53
-                             # each); pushing further to see if efficiency
-                             # can outright win rather than tie
+    cot_bonus_weight=5.0,    # pushed further past 3.0 (v=1.67, 1.5% better
+                             # than sprinter) for max efficiency, speed
+                             # target abandoned. Expect diminishing returns
+                             # to continue -- 1.5->3.0 only moved CoT from
+                             # 2.8% worse to 1.5% better while roughly
+                             # halving speed, so further gains here will
+                             # likely be small. Note: cot_bonus is forced
+                             # to 0 below min_moving_speed=0.5 m/s, so there
+                             # is a structural floor -- the agent has no
+                             # efficiency incentive to slow below that
+                             # threshold, which should prevent a full
+                             # collapse back to the earlier "stand still"
+                             # exploit even at this weight.
     slip_weight=0.001,
     max_power_cost=0.3,
     max_slip_cost=0.3,
@@ -205,8 +213,19 @@ def main():
 
     # Fine-tune from the Stage 2 checkpoint (already has a working,
     # moderately efficient gait) rather than starting from scratch.
-    source_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
-    source_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
+    stage2_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
+    stage2_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
+    existing_marathoner_path = os.path.join(models_dir, "sac_humanoid_marathoner")
+    existing_marathoner_vecnorm = os.path.join(models_dir, "vecnormalize_marathoner.pkl")
+
+    # Prefer continuing from the existing marathoner checkpoint (already at
+    # CoT=1.95, beating the sprinter) over restarting from Stage 2.
+    if os.path.exists(f"{existing_marathoner_path}.zip"):
+        source_model_path = existing_marathoner_path
+        source_vecnorm_path = existing_marathoner_vecnorm
+    else:
+        source_model_path = stage2_model_path
+        source_vecnorm_path = stage2_vecnorm_path
 
     best_model_path = os.path.join(models_dir, "sac_humanoid_marathoner")
     vecnorm_path = os.path.join(models_dir, "vecnormalize_marathoner.pkl")
