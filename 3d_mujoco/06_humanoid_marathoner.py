@@ -1,11 +1,39 @@
 """
-MARATHONER: fine-tunes from the Stage 2 checkpoint with efficiency
-(low Cost of Transport, low mechanical power) weighted heavily over raw
-speed. This agent should sacrifice velocity for genuinely low per-distance
-energy cost -- caps on power/slip are tighter here, unlike the sprinter
-where they're deliberately loose.
+MARATHONER (v2): automated exploration for maximum sustainable efficiency,
+plus two upgrades specific to "long-distance running" rather than a
+1000-step snapshot:
+
+  1. LONG-HORIZON EPISODES: training and evaluation both use a longer
+     episode length (LONG_EPISODE_STEPS) than the default 1000. Real
+     long-distance efficiency is about SUSTAINED economy, not a burst --
+     a gait that looks efficient for 1000 steps but degrades or destabilizes
+     over a longer duration isn't actually a good long-distance strategy.
+  2. ECONOMY-OF-MOTION TERM: penalizes variance in mechanical power over a
+     rolling window. This is a real, non-anthropomorphic efficiency
+     signal -- an erratic, spiky effort pattern wastes more energy for the
+     same average power than a steady one (true for any repeatable
+     locomotion system, not a human-specific prior like the old bilateral
+     symmetry penalty).
+
+Two phases, controlled by MODE below:
+  MODE = "sweep": trains several cot_bonus_weight values briefly
+                  (SWEEP_STEPS each), evaluates each deterministically,
+                  logs results to marathoner_sweep_results.csv.
+  MODE = "final": trains the winning config for a much longer budget,
+                  across multiple seeds, keeping the lowest-CoT seed.
+
+REAL PHYSICS NOTE: CoT = Power / (mass * g * velocity) is the literal
+formula used in robotics/biomechanics research. Power comes directly from
+MuJoCo's qfrc_actuator * qvel (real Watts). What is NOT modeled: electrical
+motor efficiency curves, heat losses, or muscle metabolic cost formulas
+(e.g. Minetti-Alexander) -- MuJoCo's actuators are idealized torque
+sources, and this humanoid model has no real motor specs to calibrate
+those against. If you want an approximate motor-efficiency derating factor
+layered on top, flag it explicitly -- it would be an assumption, not a
+verified real-world number.
 """
 import os
+import csv
 import time
 import warnings
 import numpy as np
@@ -19,15 +47,30 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNorm
 warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines3")
 
 GRAVITY = 9.81
-TOTAL_STEPS = 2_000_000
+
+# ============================================================================
+MODE = "sweep"  # "sweep" or "final"
+
+SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0, 20.0, 28.0]
+SWEEP_STEPS = 300_000       # short budget per sweep candidate
+SWEEP_EVAL_EPISODES = 3
+
+WINNING_COT_WEIGHT = 14.0   # <-- set this from the sweep CSV before running MODE="final"
+FINAL_STEPS = 8_000_000
+FINAL_SEEDS = [0, 1, 2]     # best-of-N: train this many seeds, keep the lowest CoT
+
+LONG_EPISODE_STEPS = 3000   # "long-distance" horizon for train + eval, vs
+                            # the default 1000-step episode
+ECONOMY_WINDOW = 50         # rolling window (steps) for power-variance term
+# ============================================================================
 
 
 class CurriculumHumanoidWrapper(gym.Wrapper):
-    def __init__(self, env, min_height=0.7, max_speed_cap=10.0,
+    def __init__(self, env, min_height=0.7, max_speed_cap=50.0,
                  alive_bonus=1.0, ctrl_cost_weight=0.05, smoothness_weight=0.02,
                  power_weight=0.0, cot_bonus_weight=0.0, slip_weight=0.0,
                  min_moving_speed=0.5, max_power_cost=1.0, max_slip_cost=1.0,
-                 speed_weight=1.0):
+                 speed_weight=1.0, economy_weight=0.0, economy_window=50):
         super().__init__(env)
         self.min_height = min_height
         self.max_speed_cap = max_speed_cap
@@ -41,11 +84,15 @@ class CurriculumHumanoidWrapper(gym.Wrapper):
         self.max_power_cost = max_power_cost
         self.max_slip_cost = max_slip_cost
         self.speed_weight = speed_weight
+        self.economy_weight = economy_weight
+        self.economy_window = economy_window
+        self._power_history = []
         self._prev_action = None
         self._total_mass = None
 
     def reset(self, **kwargs):
         self._prev_action = None
+        self._power_history = []
         return self.env.reset(**kwargs)
 
     def _get_total_mass(self, model):
@@ -128,6 +175,18 @@ class CurriculumHumanoidWrapper(gym.Wrapper):
         else:
             slip_cost = 0.0
 
+        # --- Economy of motion: penalize erratic effort over time ---
+        # A steady power draw is more energy-efficient in practice than a
+        # spiky one averaging the same value -- this is a general physical
+        # fact about repeatable locomotion, not a human-anatomy prior.
+        economy_cost = 0.0
+        if self.economy_weight > 0:
+            self._power_history.append(power)
+            if len(self._power_history) > self.economy_window:
+                self._power_history.pop(0)
+            if len(self._power_history) >= 10:
+                economy_cost = self.economy_weight * float(np.std(self._power_history))
+
         reward = (
             speed_reward
             + self.alive_bonus
@@ -136,6 +195,7 @@ class CurriculumHumanoidWrapper(gym.Wrapper):
             - smoothness_cost
             - power_cost
             - slip_cost
+            - economy_cost
         )
         if fell:
             reward -= 10.0
@@ -148,157 +208,244 @@ class CurriculumHumanoidWrapper(gym.Wrapper):
         info["mechanical_power_w"] = float(power)
         info["cost_of_transport"] = float(cot)
         info["slip_cost"] = float(slip_cost)
-        info["speed_reward"] = float(speed_reward)
-        info["cot_bonus"] = float(cot_bonus)
-        info["power_cost"] = float(power_cost)
-        info["ctrl_cost"] = float(ctrl_cost)
-        info["smoothness_cost"] = float(smoothness_cost)
 
         return obs, float(reward), terminated, truncated, info
 
 
-# Marathoner profile: efficiency dominates, speed is secondary.
-# NOTE: power_weight/max_power_cost recalibrated for the ~3000W power range
-# actually observed after curriculum fine-tuning (earlier values were tuned
-# against ~100-800W observed in prior stages and had silently saturated --
-# raw_cost/cap was ~10x, putting tanh in its near-zero-gradient region,
-# which gave almost no pressure to actually reduce power).
-MARATHONER_KWARGS = dict(
+BASE_KWARGS = dict(
     min_height=0.7,
     alive_bonus=1.0,
     ctrl_cost_weight=0.05,
     smoothness_weight=0.02,
     speed_weight=0.2,
     power_weight=0.0001,
-    cot_bonus_weight=9.0,    # pushed from 5.0 (v=1.44, CoT=1.21) -- no
-                             # plateau observed yet (velocity still well
-                             # above the min_moving_speed=0.5 floor), so
-                             # continuing the push rather than locking in.
-                             # Watch for: (a) velocity approaching 0.5,
-                             # where cot_bonus goes to a hard 0 -- this
-                             # threshold is a step function, not smooth, so
-                             # behavior near it could get unstable/oscillate
-                             # rather than settle cleanly; (b) CoT actually
-                             # getting WORSE despite the higher weight,
-                             # which would mean the floor was between 5.0
-                             # and 9.0 and this overshot it.
     slip_weight=0.001,
     max_power_cost=0.3,
     max_slip_cost=0.3,
+    max_speed_cap=50.0,
+    economy_weight=0.05,
+    economy_window=ECONOMY_WINDOW,
 )
 
 
-def make_wrapped_env(env_id, wrapper_kwargs):
+def make_wrapped_env(env_id, wrapper_kwargs, max_episode_steps=None):
     def _init():
         env = gym.make(
             env_id,
             healthy_z_range=(0.0, float("inf")),
             terminate_when_unhealthy=False,
+            max_episode_steps=max_episode_steps,
         )
         return CurriculumHumanoidWrapper(env, **wrapper_kwargs)
     return _init
 
 
-def main():
-    env_id = "Humanoid-v5"
-
-    cpu_count = os.cpu_count() or 8
-    N_ENVS = max(1, cpu_count - 2)
-    print(f"MARATHONER | Detected {cpu_count} CPU threads -> using {N_ENVS} parallel envs.")
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    models_dir = os.path.abspath(os.path.join(script_dir, "..", "models"))
-    os.makedirs(models_dir, exist_ok=True)
-
-    # Fine-tune from the Stage 2 checkpoint (already has a working,
-    # moderately efficient gait) rather than starting from scratch.
-    stage2_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
-    stage2_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
-    existing_marathoner_path = os.path.join(models_dir, "sac_humanoid_marathoner")
-    existing_marathoner_vecnorm = os.path.join(models_dir, "vecnormalize_marathoner.pkl")
-
-    # Prefer continuing from the existing marathoner checkpoint (already at
-    # CoT=1.95, beating the sprinter) over restarting from Stage 2.
-    if os.path.exists(f"{existing_marathoner_path}.zip"):
-        source_model_path = existing_marathoner_path
-        source_vecnorm_path = existing_marathoner_vecnorm
-    else:
-        source_model_path = stage2_model_path
-        source_vecnorm_path = stage2_vecnorm_path
-
-    best_model_path = os.path.join(models_dir, "sac_humanoid_marathoner")
-    vecnorm_path = os.path.join(models_dir, "vecnormalize_marathoner.pkl")
-    checkpoint_dir = os.path.join(models_dir, "checkpoints_marathoner")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
-    print("Initializing vectorized MuJoCo environments (marathoner reward)...")
-    vec_env_cls = SubprocVecEnv if N_ENVS > 1 else DummyVecEnv
-    train_env = make_vec_env(
-        make_wrapped_env(env_id, MARATHONER_KWARGS),
-        n_envs=N_ENVS,
-        vec_env_cls=vec_env_cls,
+def quick_eval(model, stats_path, wrapper_kwargs, env_id="Humanoid-v5", n_episodes=3,
+                max_episode_steps=None):
+    """Fast, non-rendered deterministic evaluation. Returns dict of averages."""
+    base_env = gym.make(
+        env_id, healthy_z_range=(0.0, float("inf")), terminate_when_unhealthy=False,
+        max_episode_steps=max_episode_steps,
     )
+    wrapped_env = CurriculumHumanoidWrapper(base_env, **wrapper_kwargs)
+    vec_env = DummyVecEnv([lambda: wrapped_env])
+    if os.path.exists(stats_path):
+        vec_env = VecNormalize.load(stats_path, vec_env)
+        vec_env.training = False
+        vec_env.norm_reward = False
+
+    velocities, powers, steps_list, cots = [], [], [], []
+    obs = vec_env.reset()
+    for _ in range(n_episodes):
+        done = False
+        step_count = 0
+        ep_v, ep_p, ep_cot = [], [], []
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done_arr, info = vec_env.step(action)
+            done = bool(done_arr[0])
+            step_count += 1
+            ep_v.append(info[0].get("forward_velocity", 0.0))
+            ep_p.append(info[0].get("mechanical_power_w", 0.0))
+            c = info[0].get("cost_of_transport", float("inf"))
+            if np.isfinite(c):
+                ep_cot.append(c)
+        velocities.append(float(np.mean(ep_v)))
+        powers.append(float(np.mean(ep_p)))
+        steps_list.append(step_count)
+        cots.append(float(np.mean(ep_cot)) if ep_cot else float("inf"))
+        obs = vec_env.reset()
+    vec_env.close()
+    return dict(
+        mean_velocity=float(np.mean(velocities)),
+        mean_power=float(np.mean(powers)),
+        mean_steps=float(np.mean(steps_list)),
+        mean_cot=float(np.mean(cots)) if all(np.isfinite(c) for c in cots) else float("inf"),
+    )
+
+
+def train_one_config(env_id, wrapper_kwargs, total_steps, seed, source_model_path,
+                      source_vecnorm_path, save_model_path, save_vecnorm_path,
+                      models_dir, tag, max_episode_steps=None):
+    cpu_count = os.cpu_count() or 8
+    n_envs = max(1, cpu_count - 2)
+
+    vec_env_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
+    train_env = make_vec_env(make_wrapped_env(env_id, wrapper_kwargs, max_episode_steps),
+                              n_envs=n_envs, vec_env_cls=vec_env_cls, seed=seed)
     train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
-    eval_env = make_vec_env(
-        make_wrapped_env(env_id, MARATHONER_KWARGS),
-        n_envs=1,
-        vec_env_cls=DummyVecEnv,
-    )
+    eval_env = make_vec_env(make_wrapped_env(env_id, wrapper_kwargs, max_episode_steps),
+                             n_envs=1, vec_env_cls=DummyVecEnv)
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
 
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=models_dir,
-        log_path=models_dir,
-        eval_freq=max(40000 // N_ENVS, 1000),
-        deterministic=True,
-        render=False,
-    )
-    checkpoint_callback = CheckpointCallback(
-        save_freq=max(100000 // N_ENVS, 1000),
-        save_path=checkpoint_dir,
-        name_prefix="sac_humanoid_marathoner",
-        save_vecnormalize=True,
-    )
+    checkpoint_dir = os.path.join(models_dir, f"checkpoints_{tag}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    eval_callback = EvalCallback(eval_env, best_model_save_path=models_dir, log_path=models_dir,
+                                  eval_freq=max(40000 // n_envs, 1000), deterministic=True, render=False)
+    checkpoint_callback = CheckpointCallback(save_freq=max(200000 // n_envs, 1000),
+                                              save_path=checkpoint_dir, name_prefix=tag, save_vecnormalize=True)
     callback = CallbackList([eval_callback, checkpoint_callback])
 
-    print(f"Loading checkpoint from '{source_model_path}.zip' to fine-tune toward marathon efficiency...")
-    if os.path.exists(source_vecnorm_path):
-        train_env = VecNormalize.load(source_vecnorm_path, train_env.venv)
-        train_env.training = True
-        train_env.norm_reward = True
-    model = SAC.load(f"{source_model_path}.zip", env=train_env, device="cuda")
-    model.ent_coef = "auto"  # re-enable exploration for fine-tuning
+    policy_kwargs = dict(net_arch=dict(pi=[512, 512], qf=[512, 512]))
 
-    print(f"Training MARATHONER for {TOTAL_STEPS:,} steps across {N_ENVS} parallel envs...")
-    model.learn(total_timesteps=TOTAL_STEPS, callback=callback, reset_num_timesteps=False)
+    if source_model_path and os.path.exists(f"{source_model_path}.zip"):
+        print(f"[{tag}] Loading '{source_model_path}.zip' to continue training...")
+        if source_vecnorm_path and os.path.exists(source_vecnorm_path):
+            train_env = VecNormalize.load(source_vecnorm_path, train_env.venv)
+            train_env.training = True
+            train_env.norm_reward = True
+        model = SAC.load(f"{source_model_path}.zip", env=train_env, device="cuda", seed=seed)
+        model.ent_coef = "auto"
+        reset_num_timesteps = False
+    else:
+        print(f"[{tag}] No source checkpoint found -- training fresh (seed={seed}).")
+        model = SAC(
+            "MlpPolicy", train_env, verbose=0, learning_rate=0.0003, buffer_size=500000,
+            batch_size=256, tau=0.005, gamma=0.99, ent_coef="auto", use_sde=True,
+            sde_sample_freq=4, policy_kwargs=policy_kwargs, device="cuda", seed=seed,
+        )
+        reset_num_timesteps = True
 
-    train_env.save(vecnorm_path)
+    print(f"[{tag}] Training for {total_steps:,} steps across {n_envs} envs (seed={seed})...")
+    model.learn(total_timesteps=total_steps, callback=callback, reset_num_timesteps=reset_num_timesteps)
+
+    train_env.save(save_vecnorm_path)
     train_env.close()
     eval_env.close()
 
     generic_saved_file = os.path.join(models_dir, "best_model.zip")
-    custom_target_file = f"{best_model_path}.zip"
     if os.path.exists(generic_saved_file):
-        if os.path.exists(custom_target_file):
-            os.remove(custom_target_file)
-        os.rename(generic_saved_file, custom_target_file)
-        print(f"Saved model as: '{custom_target_file}'")
+        if os.path.exists(f"{save_model_path}.zip"):
+            os.remove(f"{save_model_path}.zip")
+        os.rename(generic_saved_file, f"{save_model_path}.zip")
 
-    run_visual_test(best_model_path, vecnorm_path, MARATHONER_KWARGS, n_episodes=3)
+    return model
+
+
+def run_sweep(models_dir):
+    env_id = "Humanoid-v5"
+    source_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
+    source_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
+
+    if not os.path.exists(f"{source_model_path}.zip"):
+        print(f"ERROR: expected Stage-2 checkpoint at '{source_model_path}.zip'. "
+              f"Run 06_humanoid_curriculum.py (STAGE=2) first.")
+        return
+
+    results = []
+    csv_path = os.path.join(models_dir, "marathoner_sweep_results.csv")
+
+    for cw in SWEEP_COT_WEIGHTS:
+        tag = f"marathon_sweep_cw{str(cw).replace('.', 'p')}"
+        kwargs = dict(BASE_KWARGS, cot_bonus_weight=cw)
+        save_model_path = os.path.join(models_dir, tag)
+        save_vecnorm_path = os.path.join(models_dir, f"vecnormalize_{tag}.pkl")
+
+        model = train_one_config(
+            env_id, kwargs, SWEEP_STEPS, seed=0,
+            source_model_path=source_model_path, source_vecnorm_path=source_vecnorm_path,
+            save_model_path=save_model_path, save_vecnorm_path=save_vecnorm_path,
+            models_dir=models_dir, tag=tag, max_episode_steps=LONG_EPISODE_STEPS,
+        )
+        eval_result = quick_eval(model, save_vecnorm_path, kwargs, env_id, SWEEP_EVAL_EPISODES,
+                                  max_episode_steps=LONG_EPISODE_STEPS)
+        eval_result["cot_bonus_weight"] = cw
+        eval_result["survived_full_episode"] = eval_result["mean_steps"] >= (LONG_EPISODE_STEPS - 1)
+        results.append(eval_result)
+        print(f"[sweep] cot_bonus_weight={cw} -> CoT={eval_result['mean_cot']:.3f}, "
+              f"velocity={eval_result['mean_velocity']:.2f} m/s, "
+              f"power={eval_result['mean_power']:.1f} W, "
+              f"survived_full={eval_result['survived_full_episode']}")
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["cot_bonus_weight", "mean_cot", "mean_velocity",
+                                                "mean_power", "mean_steps", "survived_full_episode"])
+        writer.writeheader()
+        for r in results:
+            writer.writerow(r)
+
+    print(f"\nSweep results written to '{csv_path}'")
+    stable = [r for r in results if r["survived_full_episode"] and np.isfinite(r["mean_cot"])]
+    pool = stable if stable else [r for r in results if np.isfinite(r["mean_cot"])]
+    if not pool:
+        print("No config produced a finite CoT -- check min_moving_speed / weights.")
+        return
+    best = min(pool, key=lambda r: r["mean_cot"])
+    print(f"\nBest stable config: cot_bonus_weight={best['cot_bonus_weight']} "
+          f"-> CoT={best['mean_cot']:.3f} at {best['mean_velocity']:.2f} m/s")
+    print(f"Set WINNING_COT_WEIGHT = {best['cot_bonus_weight']} and MODE = 'final' to continue.")
+
+
+def run_final(models_dir):
+    env_id = "Humanoid-v5"
+    source_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
+    source_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
+    kwargs = dict(BASE_KWARGS, cot_bonus_weight=WINNING_COT_WEIGHT)
+
+    best_model = None
+    best_score = float("inf")
+    best_seed = None
+
+    for seed in FINAL_SEEDS:
+        tag = f"marathoner_seed{seed}"
+        save_model_path = os.path.join(models_dir, tag)
+        save_vecnorm_path = os.path.join(models_dir, f"vecnormalize_{tag}.pkl")
+
+        model = train_one_config(
+            env_id, kwargs, FINAL_STEPS, seed=seed,
+            source_model_path=source_model_path, source_vecnorm_path=source_vecnorm_path,
+            save_model_path=save_model_path, save_vecnorm_path=save_vecnorm_path,
+            models_dir=models_dir, tag=tag, max_episode_steps=LONG_EPISODE_STEPS,
+        )
+        eval_result = quick_eval(model, save_vecnorm_path, kwargs, env_id, n_episodes=5,
+                                  max_episode_steps=LONG_EPISODE_STEPS)
+        print(f"[final] seed={seed} -> CoT={eval_result['mean_cot']:.3f}, "
+              f"velocity={eval_result['mean_velocity']:.2f} m/s, "
+              f"power={eval_result['mean_power']:.1f} W")
+
+        if np.isfinite(eval_result["mean_cot"]) and eval_result["mean_cot"] < best_score:
+            best_score = eval_result["mean_cot"]
+            best_model = (save_model_path, save_vecnorm_path)
+            best_seed = seed
+
+    print(f"\nBest seed: {best_seed} -> CoT={best_score:.3f}")
+    final_model_path = os.path.join(models_dir, "sac_humanoid_marathoner")
+    final_vecnorm_path = os.path.join(models_dir, "vecnormalize_marathoner.pkl")
+    import shutil
+    shutil.copy(f"{best_model[0]}.zip", f"{final_model_path}.zip")
+    shutil.copy(best_model[1], final_vecnorm_path)
+    print(f"Best marathoner saved as '{final_model_path}.zip'")
+
+    run_visual_test(final_model_path, final_vecnorm_path, kwargs, n_episodes=3)
 
 
 def run_visual_test(best_model_path, stats_path, wrapper_kwargs, n_episodes=3):
     print("\nLaunching 3D window to watch the marathoner run...")
     env_id = "Humanoid-v5"
-
-    base_env = gym.make(
-        env_id,
-        render_mode="human",
-        healthy_z_range=(0.0, float("inf")),
-        terminate_when_unhealthy=False,
-    )
+    base_env = gym.make(env_id, render_mode="human", healthy_z_range=(0.0, float("inf")),
+                         terminate_when_unhealthy=False, max_episode_steps=LONG_EPISODE_STEPS)
     try:
         base_env.unwrapped.model.geom_size[0, :] = [1000.0, 1000.0, 1.0]
     except Exception:
@@ -306,69 +453,40 @@ def run_visual_test(best_model_path, stats_path, wrapper_kwargs, n_episodes=3):
 
     wrapped_env = CurriculumHumanoidWrapper(base_env, **wrapper_kwargs)
     vec_env = DummyVecEnv([lambda: wrapped_env])
-
     if os.path.exists(stats_path):
         vec_env = VecNormalize.load(stats_path, vec_env)
         vec_env.training = False
         vec_env.norm_reward = False
-    else:
-        print("Warning: VecNormalize stats not found -- observations will be unnormalized.")
 
     model = SAC.load(f"{best_model_path}.zip", env=vec_env, device="cuda")
 
-    all_episode_stats = []
     obs = vec_env.reset()
     try:
         for episode in range(n_episodes):
             print(f"\n=== Episode {episode + 1} ===")
             done = False
             step_count = 0
-            velocities, powers, cots, slips = [], [], [], []
-            speed_rewards, cot_bonuses, power_costs, ctrl_costs, smoothness_costs = [], [], [], [], []
-
+            velocities, powers, cots = [], [], []
             while not done:
-                action, _states = model.predict(obs, deterministic=True)
+                action, _ = model.predict(obs, deterministic=True)
                 try:
                     obs, reward, done_arr, info = vec_env.step(action)
                     done = bool(done_arr[0])
                 except Exception:
                     return
                 step_count += 1
-
                 velocities.append(info[0].get("forward_velocity", 0.0))
                 powers.append(info[0].get("mechanical_power_w", 0.0))
-                cots.append(info[0].get("cost_of_transport", 0.0))
-                slips.append(info[0].get("slip_cost", 0.0))
-                speed_rewards.append(info[0].get("speed_reward", 0.0))
-                cot_bonuses.append(info[0].get("cot_bonus", 0.0))
-                power_costs.append(info[0].get("power_cost", 0.0))
-                ctrl_costs.append(info[0].get("ctrl_cost", 0.0))
-                smoothness_costs.append(info[0].get("smoothness_cost", 0.0))
-
+                c = info[0].get("cost_of_transport", float("inf"))
+                if np.isfinite(c):
+                    cots.append(c)
                 time.sleep(1.0 / 60.0)
-
                 if done:
-                    avg_v = float(np.mean(velocities))
-                    avg_power = float(np.mean(powers))
-                    finite_cots = [c for c in cots if np.isfinite(c)]
-                    avg_cot = float(np.mean(finite_cots)) if finite_cots else float("inf")
-                    pct_moving = 100.0 * len(finite_cots) / max(len(cots), 1)
-                    avg_slip = float(np.mean(slips))
                     print(f"Steps survived: {step_count}")
-                    print(f"Avg forward velocity: {avg_v:.2f} m/s")
-                    print(f"Avg mechanical power: {avg_power:.1f} W")
-                    print(f"Avg cost of transport (while moving, {pct_moving:.0f}% of steps): {avg_cot:.3f}")
-                    print(f"Avg slip-loss term: {avg_slip:.4f}")
-                    print(f"--- Reward component magnitudes (avg per step) ---")
-                    print(f"  speed_reward:     {np.mean(speed_rewards):.3f}")
-                    print(f"  cot_bonus:        {np.mean(cot_bonuses):.4f}")
-                    print(f"  power_cost:       {np.mean(power_costs):.4f}")
-                    print(f"  slip_cost:        {avg_slip:.4f}")
-                    print(f"  ctrl_cost:        {np.mean(ctrl_costs):.4f}")
-                    print(f"  smoothness_cost:  {np.mean(smoothness_costs):.4f}")
-                    all_episode_stats.append((step_count, avg_v, avg_power, avg_cot, avg_slip))
+                    print(f"Avg forward velocity: {np.mean(velocities):.2f} m/s")
+                    print(f"Avg mechanical power: {np.mean(powers):.1f} W")
+                    print(f"Avg CoT: {np.mean(cots) if cots else float('inf'):.3f}")
                     time.sleep(1.5)
-
             obs = vec_env.reset()
     finally:
         try:
@@ -376,14 +494,18 @@ def run_visual_test(best_model_path, stats_path, wrapper_kwargs, n_episodes=3):
         except Exception:
             pass
 
-    if all_episode_stats:
-        steps, vs, pws, cots, slips = zip(*all_episode_stats)
-        print("\n=== Summary across all episodes ===")
-        print(f"Mean steps survived: {np.mean(steps):.0f}")
-        print(f"Mean velocity:       {np.mean(vs):.2f} m/s")
-        print(f"Mean power:          {np.mean(pws):.1f} W")
-        print(f"Mean cost of transport: {np.mean(cots):.3f}")
-        print(f"Mean slip-loss:      {np.mean(slips):.4f}")
+
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.abspath(os.path.join(script_dir, "..", "models"))
+    os.makedirs(models_dir, exist_ok=True)
+
+    if MODE == "sweep":
+        run_sweep(models_dir)
+    elif MODE == "final":
+        run_final(models_dir)
+    else:
+        raise ValueError(f"Unknown MODE: {MODE}")
 
 
 if __name__ == "__main__":
