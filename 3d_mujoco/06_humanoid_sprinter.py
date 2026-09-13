@@ -158,12 +158,14 @@ SPRINTER_KWARGS = dict(
     alive_bonus=1.0,
     ctrl_cost_weight=0.05,
     smoothness_weight=0.02,
-    speed_weight=2.0,        # push speed hard
-    power_weight=0.0002,     # light -- just prevents torque-spam exploits
+    speed_weight=3.5,        # pushed further from 2.0 -- v=4.20 m/s wasn't
+                             # near the max_speed_cap=10 ceiling, so there
+                             # was still room to push harder
+    power_weight=0.0002,     # unchanged -- anti-exploit only
     cot_bonus_weight=0.0,    # no efficiency incentive at all
-    slip_weight=0.0002,      # light anti-exploit only
-    max_power_cost=1.5,
-    max_slip_cost=1.5,
+    slip_weight=0.0002,      # unchanged -- anti-exploit only
+    max_power_cost=3.0,      # loosened from 1.5 -- allow even more torque
+    max_slip_cost=3.0,
 )
 
 
@@ -191,8 +193,20 @@ def main():
 
     # Fine-tune from the Stage 2 checkpoint (already has a working,
     # moderately efficient gait) rather than starting from scratch.
-    source_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
-    source_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
+    stage2_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
+    stage2_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
+    existing_sprinter_path = os.path.join(models_dir, "sac_humanoid_sprinter")
+    existing_sprinter_vecnorm = os.path.join(models_dir, "vecnormalize_sprinter.pkl")
+
+    # Prefer continuing from the existing sprinter checkpoint (already at
+    # 4.20 m/s) over restarting from Stage 2 -- no reason to relearn what's
+    # already working before pushing speed_weight further.
+    if os.path.exists(f"{existing_sprinter_path}.zip"):
+        source_model_path = existing_sprinter_path
+        source_vecnorm_path = existing_sprinter_vecnorm
+    else:
+        source_model_path = stage2_model_path
+        source_vecnorm_path = stage2_vecnorm_path
 
     best_model_path = os.path.join(models_dir, "sac_humanoid_sprinter")
     vecnorm_path = os.path.join(models_dir, "vecnormalize_sprinter.pkl")
