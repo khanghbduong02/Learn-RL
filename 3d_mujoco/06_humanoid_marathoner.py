@@ -49,21 +49,34 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "sweep"  # "sweep" or "final"
+MODE = "sweep"  # "sweep", "optuna", or "final"
 
-SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0]  # narrowed back to the range already
-                                         # proven stable at 1000-step episodes
-                                         # (9.0 gave CoT=1.21, no instability)
-                                         # -- re-verifying at the longer
-                                         # horizon rather than sweeping blind
-SWEEP_STEPS = 900_000       # 3x the original 300k, matching the 3x longer
-                              # episode length so each candidate gets a
-                              # comparable ~10 full episodes of experience
-                              # per env, same as the original 1000-step sweep
+SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0]
+SWEEP_STEPS = 900_000
 SWEEP_EVAL_EPISODES = 3
 
+# Optuna: jointly tunes cot_bonus_weight, power/slip weights and caps, the
+# new economy_weight term, AND core SAC hyperparameters, with pruning.
+# Requires: pip install optuna
+OPTUNA_TRIALS = 15
+OPTUNA_TRIAL_STEPS = 1_800_000    # 2x SWEEP_STEPS -- this reward has more
+                                     # moving parts than the sprinter's and
+                                     # we already learned once that too
+                                     # short a budget at this episode length
+                                     # produces meaningless rankings
+OPTUNA_PRUNE_EVERY_STEPS = 300_000  # matches SWEEP_STEPS's cadence -- each
+                                     # check point corresponds to roughly a
+                                     # full 3000-step episode per env, not a
+                                     # fraction of one. Pruning on a shorter
+                                     # interval than this would risk killing
+                                     # a trial before it had a fair chance
+                                     # to stabilize, the same mistake that
+                                     # broke the manual sweep at 300k total
+                                     # steps.
+
 WINNING_COT_WEIGHT = 9.0    # <-- set this from the sweep CSV before running MODE="final"
-FINAL_STEPS = 20_000_000    # scaled up from 8M for the same reason as SWEEP_STEPS
+WINNING_HPARAMS = None      # <-- set this from the Optuna study's best_trial.params instead
+FINAL_STEPS = 20_000_000
 FINAL_SEEDS = [0, 1, 2]     # best-of-N: train this many seeds, keep the lowest CoT
 
 LONG_EPISODE_STEPS = 3000   # "long-distance" horizon for train + eval, vs
@@ -291,9 +304,32 @@ def quick_eval(model, stats_path, wrapper_kwargs, env_id="Humanoid-v5", n_episod
     )
 
 
+def apply_hparam_overrides(model, hparams):
+    """Same as the sprinter script's version -- see that file for full
+    rationale on what's safely overridable post-load vs. not."""
+    if not hparams:
+        return model
+    if "learning_rate" in hparams:
+        lr = hparams["learning_rate"]
+        model.learning_rate = lr
+        for param_group in model.actor.optimizer.param_groups:
+            param_group["lr"] = lr
+        for param_group in model.critic.optimizer.param_groups:
+            param_group["lr"] = lr
+    if "tau" in hparams:
+        model.tau = hparams["tau"]
+    if "gamma" in hparams:
+        model.gamma = hparams["gamma"]
+    if "batch_size" in hparams:
+        model.batch_size = hparams["batch_size"]
+    if "sde_sample_freq" in hparams:
+        model.sde_sample_freq = hparams["sde_sample_freq"]
+    return model
+
+
 def train_one_config(env_id, wrapper_kwargs, total_steps, seed, source_model_path,
                       source_vecnorm_path, save_model_path, save_vecnorm_path,
-                      models_dir, tag, max_episode_steps=None):
+                      models_dir, tag, max_episode_steps=None, hparams=None):
     cpu_count = os.cpu_count() or 8
     n_envs = max(1, cpu_count - 2)
 
@@ -325,13 +361,21 @@ def train_one_config(env_id, wrapper_kwargs, total_steps, seed, source_model_pat
             train_env.norm_reward = True
         model = SAC.load(f"{source_model_path}.zip", env=train_env, device="cuda", seed=seed)
         model.ent_coef = "auto"
+        model = apply_hparam_overrides(model, hparams)
         reset_num_timesteps = False
     else:
         print(f"[{tag}] No source checkpoint found -- training fresh (seed={seed}).")
+        h = hparams or {}
         model = SAC(
-            "MlpPolicy", train_env, verbose=0, learning_rate=0.0003, buffer_size=500000,
-            batch_size=256, tau=0.005, gamma=0.99, ent_coef="auto", use_sde=True,
-            sde_sample_freq=4, policy_kwargs=policy_kwargs, device="cuda", seed=seed,
+            "MlpPolicy", train_env, verbose=0,
+            learning_rate=h.get("learning_rate", 0.0003),
+            buffer_size=500000,
+            batch_size=h.get("batch_size", 256),
+            tau=h.get("tau", 0.005),
+            gamma=h.get("gamma", 0.99),
+            ent_coef="auto", use_sde=True,
+            sde_sample_freq=h.get("sde_sample_freq", 4),
+            policy_kwargs=policy_kwargs, device="cuda", seed=seed,
         )
         reset_num_timesteps = True
 
@@ -415,11 +459,136 @@ def run_sweep(models_dir):
     print(f"Set WINNING_COT_WEIGHT = {best['cot_bonus_weight']} and MODE = 'final' to continue.")
 
 
+def run_optuna_search(models_dir):
+    """
+    Optuna-driven joint search over cot_bonus_weight, power_weight,
+    slip_weight, economy_weight, the effort caps, and core SAC
+    hyperparameters -- with pruning intervals sized to the 3000-step
+    episode length (see OPTUNA_PRUNE_EVERY_STEPS comment above). This is
+    the marathoner counterpart to the sprinter's run_optuna_search.
+
+    The objective directly minimizes CoT, but ONLY among trials that
+    survive the full LONG_EPISODE_STEPS episode -- any trial that falls
+    early gets a heavy fixed penalty (1000.0) regardless of how good its
+    CoT looked for however many steps it did survive. This closes the
+    exact failure mode that broke the manual sweep: a config that's very
+    efficient for a brief unsustainable burst must never be allowed to
+    look better than a config that's modestly efficient but genuinely
+    sustains the full distance.
+    """
+    try:
+        import optuna
+    except ImportError:
+        print("Optuna is not installed. Run: pip install optuna")
+        return
+
+    env_id = "Humanoid-v5"
+    source_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
+    source_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
+
+    if not os.path.exists(f"{source_model_path}.zip"):
+        print(f"ERROR: expected Stage-2 checkpoint at '{source_model_path}.zip'. "
+              f"Run 06_humanoid_curriculum.py (STAGE=2) first.")
+        return
+
+    UNSTABLE_PENALTY = 1000.0
+
+    def objective(trial):
+        cot_bonus_weight = trial.suggest_float("cot_bonus_weight", 3.0, 16.0)
+        power_weight = trial.suggest_float("power_weight", 0.00005, 0.0005, log=True)
+        slip_weight = trial.suggest_float("slip_weight", 0.0005, 0.002, log=True)
+        economy_weight = trial.suggest_float("economy_weight", 0.0, 0.15)
+        max_power_cost = trial.suggest_float("max_power_cost", 0.1, 1.0)
+        max_slip_cost = trial.suggest_float("max_slip_cost", 0.1, 1.0)
+        learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-3, log=True)
+        tau = trial.suggest_float("tau", 0.002, 0.02, log=True)
+        gamma = trial.suggest_float("gamma", 0.98, 0.999)
+        batch_size = trial.suggest_categorical("batch_size", [128, 256, 512])
+        sde_sample_freq = trial.suggest_categorical("sde_sample_freq", [4, 8, 16])
+
+        kwargs = dict(BASE_KWARGS, cot_bonus_weight=cot_bonus_weight, power_weight=power_weight,
+                      slip_weight=slip_weight, economy_weight=economy_weight,
+                      max_power_cost=max_power_cost, max_slip_cost=max_slip_cost)
+        hparams = dict(learning_rate=learning_rate, tau=tau, gamma=gamma,
+                        batch_size=batch_size, sde_sample_freq=sde_sample_freq)
+
+        tag = f"optuna_trial{trial.number}"
+        save_model_path = os.path.join(models_dir, tag)
+        save_vecnorm_path = os.path.join(models_dir, f"vecnormalize_{tag}.pkl")
+
+        steps_done = 0
+        score = UNSTABLE_PENALTY
+        while steps_done < OPTUNA_TRIAL_STEPS:
+            chunk = min(OPTUNA_PRUNE_EVERY_STEPS, OPTUNA_TRIAL_STEPS - steps_done)
+            model = train_one_config(
+                env_id, kwargs, chunk, seed=0,
+                source_model_path=source_model_path if steps_done == 0 else save_model_path,
+                source_vecnorm_path=source_vecnorm_path if steps_done == 0 else save_vecnorm_path,
+                save_model_path=save_model_path, save_vecnorm_path=save_vecnorm_path,
+                models_dir=models_dir, tag=tag, max_episode_steps=LONG_EPISODE_STEPS,
+                hparams=hparams,
+            )
+            steps_done += chunk
+
+            eval_result = quick_eval(model, save_vecnorm_path, kwargs, env_id, n_episodes=3,
+                                      max_episode_steps=LONG_EPISODE_STEPS)
+            survived = eval_result["mean_steps"] >= (LONG_EPISODE_STEPS - 1)
+            score = eval_result["mean_cot"] if (survived and np.isfinite(eval_result["mean_cot"])) \
+                else UNSTABLE_PENALTY
+            trial.report(score, steps_done)
+            print(f"[optuna trial {trial.number}] steps={steps_done:,} -> "
+                  f"CoT={eval_result['mean_cot']:.3f}, survived={survived} "
+                  f"({eval_result['mean_steps']:.0f}/{LONG_EPISODE_STEPS}), score={score:.3f}")
+
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        return score
+
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=1)
+    study = optuna.create_study(direction="minimize", pruner=pruner)
+    study.optimize(objective, n_trials=OPTUNA_TRIALS)
+
+    print("\n=== Optuna search complete ===")
+    print(f"Best trial: #{study.best_trial.number}, CoT={study.best_value:.3f}")
+    print(f"Best params: {study.best_trial.params}")
+    if study.best_value >= UNSTABLE_PENALTY:
+        print("WARNING: even the best trial never survived the full episode. "
+              "Consider narrowing the search ranges further or increasing "
+              "OPTUNA_TRIAL_STEPS before trusting any result from this run.")
+
+    results_path = os.path.join(models_dir, "marathoner_optuna_results.csv")
+    with open(results_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = ["trial_number", "value"] + list(study.best_trial.params.keys())
+        writer.writerow(header)
+        for t in study.trials:
+            if t.value is not None:
+                writer.writerow([t.number, t.value] + [t.params.get(k) for k in study.best_trial.params.keys()])
+    print(f"Full results written to '{results_path}'")
+    print("\nSet WINNING_HPARAMS = " + str(study.best_trial.params) + " and MODE = 'final' to continue.")
+
+
 def run_final(models_dir):
     env_id = "Humanoid-v5"
     source_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
     source_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
-    kwargs = dict(BASE_KWARGS, cot_bonus_weight=WINNING_COT_WEIGHT)
+
+    if WINNING_HPARAMS is not None:
+        hp = dict(WINNING_HPARAMS)
+        cot_bonus_weight = hp.pop("cot_bonus_weight")
+        power_weight = hp.pop("power_weight", BASE_KWARGS["power_weight"])
+        slip_weight = hp.pop("slip_weight", BASE_KWARGS["slip_weight"])
+        economy_weight = hp.pop("economy_weight", BASE_KWARGS["economy_weight"])
+        max_power_cost = hp.pop("max_power_cost", BASE_KWARGS["max_power_cost"])
+        max_slip_cost = hp.pop("max_slip_cost", BASE_KWARGS["max_slip_cost"])
+        kwargs = dict(BASE_KWARGS, cot_bonus_weight=cot_bonus_weight, power_weight=power_weight,
+                      slip_weight=slip_weight, economy_weight=economy_weight,
+                      max_power_cost=max_power_cost, max_slip_cost=max_slip_cost)
+        sac_hparams = hp  # remaining: learning_rate, tau, gamma, batch_size, sde_sample_freq
+    else:
+        kwargs = dict(BASE_KWARGS, cot_bonus_weight=WINNING_COT_WEIGHT)
+        sac_hparams = None
 
     best_model = None
     best_score = float("inf")
@@ -435,17 +604,26 @@ def run_final(models_dir):
             source_model_path=source_model_path, source_vecnorm_path=source_vecnorm_path,
             save_model_path=save_model_path, save_vecnorm_path=save_vecnorm_path,
             models_dir=models_dir, tag=tag, max_episode_steps=LONG_EPISODE_STEPS,
+            hparams=sac_hparams,
         )
         eval_result = quick_eval(model, save_vecnorm_path, kwargs, env_id, n_episodes=5,
                                   max_episode_steps=LONG_EPISODE_STEPS)
+        survived = eval_result["mean_steps"] >= (LONG_EPISODE_STEPS - 1)
         print(f"[final] seed={seed} -> CoT={eval_result['mean_cot']:.3f}, "
               f"velocity={eval_result['mean_velocity']:.2f} m/s, "
-              f"power={eval_result['mean_power']:.1f} W")
+              f"power={eval_result['mean_power']:.1f} W, "
+              f"steps={eval_result['mean_steps']:.0f}/{LONG_EPISODE_STEPS}, survived={survived}")
 
-        if np.isfinite(eval_result["mean_cot"]) and eval_result["mean_cot"] < best_score:
+        if survived and np.isfinite(eval_result["mean_cot"]) and eval_result["mean_cot"] < best_score:
             best_score = eval_result["mean_cot"]
             best_model = (save_model_path, save_vecnorm_path)
             best_seed = seed
+
+    if best_model is None:
+        print("\nWARNING: no seed survived the full episode. Not saving a final model -- "
+              "rerun with a less aggressive cot_bonus_weight / economy_weight instead of "
+              "trusting an unstable result.")
+        return
 
     print(f"\nBest seed: {best_seed} -> CoT={best_score:.3f}")
     final_model_path = os.path.join(models_dir, "sac_humanoid_marathoner")
@@ -519,6 +697,8 @@ def main():
 
     if MODE == "sweep":
         run_sweep(models_dir)
+    elif MODE == "optuna":
+        run_optuna_search(models_dir)
     elif MODE == "final":
         run_final(models_dir)
     else:
