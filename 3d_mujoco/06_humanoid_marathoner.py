@@ -49,14 +49,21 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "final"  # "sweep" or "final"
+MODE = "sweep"  # "sweep" or "final"
 
-SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0, 20.0, 28.0]
-SWEEP_STEPS = 300_000       # short budget per sweep candidate
+SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0]  # narrowed back to the range already
+                                         # proven stable at 1000-step episodes
+                                         # (9.0 gave CoT=1.21, no instability)
+                                         # -- re-verifying at the longer
+                                         # horizon rather than sweeping blind
+SWEEP_STEPS = 900_000       # 3x the original 300k, matching the 3x longer
+                              # episode length so each candidate gets a
+                              # comparable ~10 full episodes of experience
+                              # per env, same as the original 1000-step sweep
 SWEEP_EVAL_EPISODES = 3
 
-WINNING_COT_WEIGHT = 28.0   # <-- set this from the sweep CSV before running MODE="final"
-FINAL_STEPS = 8_000_000
+WINNING_COT_WEIGHT = 9.0    # <-- set this from the sweep CSV before running MODE="final"
+FINAL_STEPS = 20_000_000    # scaled up from 8M for the same reason as SWEEP_STEPS
 FINAL_SEEDS = [0, 1, 2]     # best-of-N: train this many seeds, keep the lowest CoT
 
 LONG_EPISODE_STEPS = 3000   # "long-distance" horizon for train + eval, vs
@@ -388,13 +395,23 @@ def run_sweep(models_dir):
 
     print(f"\nSweep results written to '{csv_path}'")
     stable = [r for r in results if r["survived_full_episode"] and np.isfinite(r["mean_cot"])]
-    pool = stable if stable else [r for r in results if np.isfinite(r["mean_cot"])]
-    if not pool:
-        print("No config produced a finite CoT -- check min_moving_speed / weights.")
-        return
-    best = min(pool, key=lambda r: r["mean_cot"])
-    print(f"\nBest stable config: cot_bonus_weight={best['cot_bonus_weight']} "
-          f"-> CoT={best['mean_cot']:.3f} at {best['mean_velocity']:.2f} m/s")
+    if stable:
+        best = min(stable, key=lambda r: r["mean_cot"])
+        print(f"\nBest STABLE config (survived full {LONG_EPISODE_STEPS}-step episode): "
+              f"cot_bonus_weight={best['cot_bonus_weight']} -> CoT={best['mean_cot']:.3f} "
+              f"at {best['mean_velocity']:.2f} m/s")
+    else:
+        finite = [r for r in results if np.isfinite(r["mean_cot"])]
+        pool = finite if finite else results
+        best = min(pool, key=lambda r: r["mean_cot"])
+        print(f"\nWARNING: no swept config survived the full {LONG_EPISODE_STEPS}-step episode. "
+              f"The lowest-CoT candidate below did NOT survive and is likely just a brief "
+              f"efficient burst before falling, not genuine sustained running -- do not use it "
+              f"for MODE='final' as-is. Consider lowering the top of SWEEP_COT_WEIGHTS, or "
+              f"raising SWEEP_STEPS so candidates have more time to stabilize before judging them.")
+        print(f"Lowest-CoT (unstable) candidate: cot_bonus_weight={best['cot_bonus_weight']} "
+              f"-> CoT={best['mean_cot']:.3f} at {best['mean_velocity']:.2f} m/s, "
+              f"survived only {best['mean_steps']:.0f}/{LONG_EPISODE_STEPS} steps")
     print(f"Set WINNING_COT_WEIGHT = {best['cot_bonus_weight']} and MODE = 'final' to continue.")
 
 
