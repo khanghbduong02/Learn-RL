@@ -36,13 +36,26 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "final"  # "sweep" or "final"
+MODE = "optuna"  # "sweep", "optuna", or "final"
 
 SWEEP_SPEED_WEIGHTS = [2.0, 3.5, 5.0, 7.0, 10.0]
 SWEEP_STEPS = 300_000       # short budget per sweep candidate
 SWEEP_EVAL_EPISODES = 3
 
-WINNING_SPEED_WEIGHT = 10.0  # <-- set this from the sweep CSV before running MODE="final"
+# Optuna: tunes speed_weight AND core SAC hyperparameters together, with
+# early pruning of unpromising trials. Requires: pip install optuna
+OPTUNA_TRIALS = 20
+OPTUNA_TRIAL_STEPS = 500_000   # per trial -- the flat 300k sweep undersold
+                                 # speed_weight=10.0, which later hit 4.6+
+                                 # m/s with more steps; using a longer
+                                 # per-trial budget here, offset by pruning
+                                 # to cut compute on the trials that don't
+                                 # need the full budget to look bad.
+OPTUNA_PRUNE_EVERY_STEPS = 100_000
+
+WINNING_SPEED_WEIGHT = 5.0  # <-- set this from the sweep CSV before running MODE="final"
+WINNING_HPARAMS = None      # <-- set this from the Optuna study's best_trial.params instead,
+                             # if you ran MODE="optuna" (overrides WINNING_SPEED_WEIGHT)
 FINAL_STEPS = 8_000_000
 FINAL_SEEDS = [0, 1, 2]     # best-of-N: train this many seeds, keep the best
 # ============================================================================
@@ -240,9 +253,45 @@ def quick_eval(model, stats_path, wrapper_kwargs, env_id="Humanoid-v5", n_episod
     )
 
 
+def apply_hparam_overrides(model, hparams):
+    """
+    Override mutable SAC hyperparameters on an already-loaded model.
+    NOTE: this does NOT touch network architecture (net_arch) -- changing
+    that requires a fresh model with mismatched weight shapes, incompatible
+    with warm-starting from the Stage-2 checkpoint. buffer_size is also
+    left alone deliberately: resizing an existing replay buffer safely
+    requires reconstructing the buffer object, which is more invasive than
+    the gains here are worth. What IS safely overridable post-load:
+    learning_rate (pushed into the actual PyTorch optimizer param groups,
+    not just the model attribute, since SB3 reads from the optimizer during
+    training), tau, gamma, batch_size, use_sde-related sampling frequency.
+    This mirrors (and actually completes) the pattern that was left
+    commented-out in the very first warm-start experiment archived earlier
+    in this project.
+    """
+    if not hparams:
+        return model
+    if "learning_rate" in hparams:
+        lr = hparams["learning_rate"]
+        model.learning_rate = lr
+        for param_group in model.actor.optimizer.param_groups:
+            param_group["lr"] = lr
+        for param_group in model.critic.optimizer.param_groups:
+            param_group["lr"] = lr
+    if "tau" in hparams:
+        model.tau = hparams["tau"]
+    if "gamma" in hparams:
+        model.gamma = hparams["gamma"]
+    if "batch_size" in hparams:
+        model.batch_size = hparams["batch_size"]
+    if "sde_sample_freq" in hparams:
+        model.sde_sample_freq = hparams["sde_sample_freq"]
+    return model
+
+
 def train_one_config(env_id, wrapper_kwargs, total_steps, seed, source_model_path,
                       source_vecnorm_path, save_model_path, save_vecnorm_path,
-                      models_dir, tag):
+                      models_dir, tag, hparams=None):
     cpu_count = os.cpu_count() or 8
     n_envs = max(1, cpu_count - 2)
 
@@ -273,13 +322,21 @@ def train_one_config(env_id, wrapper_kwargs, total_steps, seed, source_model_pat
             train_env.norm_reward = True
         model = SAC.load(f"{source_model_path}.zip", env=train_env, device="cuda", seed=seed)
         model.ent_coef = "auto"
+        model = apply_hparam_overrides(model, hparams)
         reset_num_timesteps = False
     else:
         print(f"[{tag}] No source checkpoint found -- training fresh (seed={seed}).")
+        h = hparams or {}
         model = SAC(
-            "MlpPolicy", train_env, verbose=0, learning_rate=0.0003, buffer_size=500000,
-            batch_size=256, tau=0.005, gamma=0.99, ent_coef="auto", use_sde=True,
-            sde_sample_freq=4, policy_kwargs=policy_kwargs, device="cuda", seed=seed,
+            "MlpPolicy", train_env, verbose=0,
+            learning_rate=h.get("learning_rate", 0.0003),
+            buffer_size=500000,
+            batch_size=h.get("batch_size", 256),
+            tau=h.get("tau", 0.005),
+            gamma=h.get("gamma", 0.99),
+            ent_coef="auto", use_sde=True,
+            sde_sample_freq=h.get("sde_sample_freq", 4),
+            policy_kwargs=policy_kwargs, device="cuda", seed=seed,
         )
         reset_num_timesteps = True
 
@@ -348,11 +405,120 @@ def run_sweep(models_dir):
     print(f"Set WINNING_SPEED_WEIGHT = {best['speed_weight']} and MODE = 'final' to continue.")
 
 
+def run_optuna_search(models_dir):
+    """
+    Optuna-driven joint search over speed_weight, effort-cap looseness, and
+    core SAC optimization hyperparameters, with median-based pruning to cut
+    compute on trials that are clearly underperforming partway through.
+
+    Deliberately NOT tuned here: network architecture (breaks warm-start
+    weight compatibility with the Stage-2 checkpoint), buffer_size (safely
+    resizing an existing replay buffer post-load is more invasive than the
+    likely payoff), and the anti-exploit power/slip WEIGHTS themselves
+    (power_weight, slip_weight stay fixed at their proven-safe values --
+    given how much of this project was spent recovering from reward
+    exploits, loosening the caps is explored, but not the weights that
+    keep them from vanishing to zero-cost).
+    """
+    try:
+        import optuna
+    except ImportError:
+        print("Optuna is not installed. Run: pip install optuna")
+        return
+
+    env_id = "Humanoid-v5"
+    source_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
+    source_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
+
+    if not os.path.exists(f"{source_model_path}.zip"):
+        print(f"ERROR: expected Stage-2 checkpoint at '{source_model_path}.zip'. "
+              f"Run 06_humanoid_curriculum.py (STAGE=2) first.")
+        return
+
+    def objective(trial):
+        speed_weight = trial.suggest_float("speed_weight", 5.0, 25.0)
+        max_power_cost = trial.suggest_float("max_power_cost", 1.0, 5.0)
+        max_slip_cost = trial.suggest_float("max_slip_cost", 1.0, 5.0)
+        learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-3, log=True)
+        tau = trial.suggest_float("tau", 0.002, 0.02, log=True)
+        gamma = trial.suggest_float("gamma", 0.98, 0.999)
+        batch_size = trial.suggest_categorical("batch_size", [128, 256, 512])
+        sde_sample_freq = trial.suggest_categorical("sde_sample_freq", [4, 8, 16])
+
+        kwargs = dict(BASE_KWARGS, speed_weight=speed_weight,
+                      max_power_cost=max_power_cost, max_slip_cost=max_slip_cost)
+        hparams = dict(learning_rate=learning_rate, tau=tau, gamma=gamma,
+                        batch_size=batch_size, sde_sample_freq=sde_sample_freq)
+
+        tag = f"optuna_trial{trial.number}"
+        save_model_path = os.path.join(models_dir, tag)
+        save_vecnorm_path = os.path.join(models_dir, f"vecnormalize_{tag}.pkl")
+
+        # Train in chunks so we can report intermediate progress to Optuna
+        # and prune early if a trial is clearly underperforming, instead
+        # of always spending the full OPTUNA_TRIAL_STEPS budget on it.
+        steps_done = 0
+        model = None
+        while steps_done < OPTUNA_TRIAL_STEPS:
+            chunk = min(OPTUNA_PRUNE_EVERY_STEPS, OPTUNA_TRIAL_STEPS - steps_done)
+            model = train_one_config(
+                env_id, kwargs, chunk, seed=0,
+                source_model_path=source_model_path if steps_done == 0 else save_model_path,
+                source_vecnorm_path=source_vecnorm_path if steps_done == 0 else save_vecnorm_path,
+                save_model_path=save_model_path, save_vecnorm_path=save_vecnorm_path,
+                models_dir=models_dir, tag=tag, hparams=hparams,
+            )
+            steps_done += chunk
+
+            eval_result = quick_eval(model, save_vecnorm_path, kwargs, env_id, n_episodes=3)
+            score = eval_result["mean_velocity"] if eval_result["mean_steps"] >= 999 else -1.0
+            trial.report(score, steps_done)
+            print(f"[optuna trial {trial.number}] steps={steps_done:,} -> "
+                  f"velocity={eval_result['mean_velocity']:.2f} m/s, score={score:.2f}")
+
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        return score
+
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=1)
+    study = optuna.create_study(direction="maximize", pruner=pruner)
+    study.optimize(objective, n_trials=OPTUNA_TRIALS)
+
+    print("\n=== Optuna search complete ===")
+    print(f"Best trial: #{study.best_trial.number}, score={study.best_value:.2f}")
+    print(f"Best params: {study.best_trial.params}")
+
+    results_path = os.path.join(models_dir, "sprinter_optuna_results.csv")
+    with open(results_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = ["trial_number", "value"] + list(study.best_trial.params.keys())
+        writer.writerow(header)
+        for t in study.trials:
+            if t.value is not None:
+                writer.writerow([t.number, t.value] + [t.params.get(k) for k in study.best_trial.params.keys()])
+    print(f"Full results written to '{results_path}'")
+    print("\nSet WINNING_HPARAMS = " + str(study.best_trial.params) + " and MODE = 'final' to continue.")
+
+
 def run_final(models_dir):
     env_id = "Humanoid-v5"
     source_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
     source_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
-    kwargs = dict(BASE_KWARGS, speed_weight=WINNING_SPEED_WEIGHT)
+
+    if WINNING_HPARAMS is not None:
+        # Optuna path: WINNING_HPARAMS contains speed_weight plus SAC
+        # hyperparameter overrides discovered by the study.
+        hp = dict(WINNING_HPARAMS)
+        speed_weight = hp.pop("speed_weight")
+        max_power_cost = hp.pop("max_power_cost", BASE_KWARGS["max_power_cost"])
+        max_slip_cost = hp.pop("max_slip_cost", BASE_KWARGS["max_slip_cost"])
+        kwargs = dict(BASE_KWARGS, speed_weight=speed_weight,
+                      max_power_cost=max_power_cost, max_slip_cost=max_slip_cost)
+        sac_hparams = hp  # whatever's left: learning_rate, tau, gamma, batch_size, sde_sample_freq
+    else:
+        kwargs = dict(BASE_KWARGS, speed_weight=WINNING_SPEED_WEIGHT)
+        sac_hparams = None
 
     best_model = None
     best_score = -float("inf")
@@ -367,7 +533,7 @@ def run_final(models_dir):
             env_id, kwargs, FINAL_STEPS, seed=seed,
             source_model_path=source_model_path, source_vecnorm_path=source_vecnorm_path,
             save_model_path=save_model_path, save_vecnorm_path=save_vecnorm_path,
-            models_dir=models_dir, tag=tag,
+            models_dir=models_dir, tag=tag, hparams=sac_hparams,
         )
         eval_result = quick_eval(model, save_vecnorm_path, kwargs, env_id, n_episodes=5)
         print(f"[final] seed={seed} -> velocity={eval_result['mean_velocity']:.2f} m/s, "
@@ -446,6 +612,8 @@ def main():
 
     if MODE == "sweep":
         run_sweep(models_dir)
+    elif MODE == "optuna":
+        run_optuna_search(models_dir)
     elif MODE == "final":
         run_final(models_dir)
     else:
