@@ -27,9 +27,9 @@ import numpy as np
 import mujoco
 import gymnasium as gym
 from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, CallbackList
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, CallbackList, BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize, sync_envs_normalization
 
 warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines3")
 
@@ -405,6 +405,76 @@ def run_sweep(models_dir):
     print(f"Set WINNING_SPEED_WEIGHT = {best['speed_weight']} and MODE = 'final' to continue.")
 
 
+class OptunaPruningCallback(BaseCallback):
+    """
+    Periodically evaluates the current policy on a PERSISTENT eval_env
+    (created once per trial, reused for every check) and reports progress
+    to Optuna, stopping training early if the trial should be pruned.
+
+    This replaces an earlier design that called train_one_config() in a
+    loop, tearing down and recreating a ~30-process SubprocVecEnv on every
+    pruning check -- which reliably exhausted Windows' desktop heap after
+    a handful of trials (WinError 1450). Creating the environment once per
+    trial and pruning WITHIN a single model.learn() call avoids that
+    entirely: at most one SubprocVecEnv spawn/teardown per trial, not one
+    per chunk.
+    """
+    def __init__(self, trial, eval_env, eval_freq, n_eval_episodes=3, verbose=0):
+        super().__init__(verbose)
+        self.trial = trial
+        self.eval_env = eval_env
+        self.eval_freq = eval_freq
+        self.n_eval_episodes = n_eval_episodes
+        self.pruned = False
+        self.last_score = -float("inf")
+        self._last_eval_step = 0
+
+    def _on_step(self):
+        if self.num_timesteps - self._last_eval_step >= self.eval_freq:
+            self._last_eval_step = self.num_timesteps
+            sync_envs_normalization(self.model.get_env(), self.eval_env)
+            result = evaluate_on_vec_env(self.model, self.eval_env, self.n_eval_episodes)
+            score = result["mean_velocity"] if result["mean_steps"] >= 999 else -1.0
+            self.last_score = score
+            self.trial.report(score, self.num_timesteps)
+            if self.verbose >= 0:
+                print(f"[optuna trial {self.trial.number}] steps={self.num_timesteps:,} -> "
+                      f"velocity={result['mean_velocity']:.2f} m/s, score={score:.2f}")
+            if self.trial.should_prune():
+                self.pruned = True
+                return False
+        return True
+
+
+def evaluate_on_vec_env(model, vec_env, n_episodes=3):
+    """Same rollout logic as quick_eval, but operates on an already-built,
+    already-normalized vec_env instead of constructing one from a saved
+    stats file -- needed so the pruning callback can reuse one persistent
+    env across many checks within a trial rather than reloading from disk."""
+    velocities, powers, steps_list = [], [], []
+    obs = vec_env.reset()
+    for _ in range(n_episodes):
+        done = False
+        step_count = 0
+        ep_v, ep_p = [], []
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done_arr, info = vec_env.step(action)
+            done = bool(done_arr[0])
+            step_count += 1
+            ep_v.append(info[0].get("forward_velocity", 0.0))
+            ep_p.append(info[0].get("mechanical_power_w", 0.0))
+        velocities.append(float(np.mean(ep_v)))
+        powers.append(float(np.mean(ep_p)))
+        steps_list.append(step_count)
+        obs = vec_env.reset()
+    return dict(
+        mean_velocity=float(np.mean(velocities)),
+        mean_power=float(np.mean(powers)),
+        mean_steps=float(np.mean(steps_list)),
+    )
+
+
 def run_optuna_search(models_dir):
     """
     Optuna-driven joint search over speed_weight, effort-cap looseness, and
@@ -454,32 +524,42 @@ def run_optuna_search(models_dir):
         save_model_path = os.path.join(models_dir, tag)
         save_vecnorm_path = os.path.join(models_dir, f"vecnormalize_{tag}.pkl")
 
-        # Train in chunks so we can report intermediate progress to Optuna
-        # and prune early if a trial is clearly underperforming, instead
-        # of always spending the full OPTUNA_TRIAL_STEPS budget on it.
-        steps_done = 0
-        model = None
-        while steps_done < OPTUNA_TRIAL_STEPS:
-            chunk = min(OPTUNA_PRUNE_EVERY_STEPS, OPTUNA_TRIAL_STEPS - steps_done)
-            model = train_one_config(
-                env_id, kwargs, chunk, seed=0,
-                source_model_path=source_model_path if steps_done == 0 else save_model_path,
-                source_vecnorm_path=source_vecnorm_path if steps_done == 0 else save_vecnorm_path,
-                save_model_path=save_model_path, save_vecnorm_path=save_vecnorm_path,
-                models_dir=models_dir, tag=tag, hparams=hparams,
-            )
-            steps_done += chunk
+        cpu_count = os.cpu_count() or 8
+        n_envs = max(1, cpu_count - 2)
 
-            eval_result = quick_eval(model, save_vecnorm_path, kwargs, env_id, n_episodes=3)
-            score = eval_result["mean_velocity"] if eval_result["mean_steps"] >= 999 else -1.0
-            trial.report(score, steps_done)
-            print(f"[optuna trial {trial.number}] steps={steps_done:,} -> "
-                  f"velocity={eval_result['mean_velocity']:.2f} m/s, score={score:.2f}")
+        # Environments are created ONCE for this entire trial.
+        vec_env_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
+        train_env = make_vec_env(make_wrapped_env(env_id, kwargs), n_envs=n_envs,
+                                  vec_env_cls=vec_env_cls, seed=0)
+        train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
-            if trial.should_prune():
-                raise optuna.TrialPruned()
+        eval_env = make_vec_env(make_wrapped_env(env_id, kwargs), n_envs=1, vec_env_cls=DummyVecEnv)
+        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
 
-        return score
+        if os.path.exists(source_vecnorm_path):
+            train_env = VecNormalize.load(source_vecnorm_path, train_env.venv)
+            train_env.training = True
+            train_env.norm_reward = True
+
+        model = SAC.load(f"{source_model_path}.zip", env=train_env, device="cuda", seed=0)
+        model.ent_coef = "auto"
+        model = apply_hparam_overrides(model, hparams)
+
+        pruning_callback = OptunaPruningCallback(trial, eval_env, eval_freq=OPTUNA_PRUNE_EVERY_STEPS)
+
+        try:
+            model.learn(total_timesteps=OPTUNA_TRIAL_STEPS, callback=pruning_callback,
+                        reset_num_timesteps=False)
+        finally:
+            train_env.save(save_vecnorm_path)
+            model.save(f"{save_model_path}.zip")
+            train_env.close()
+            eval_env.close()
+
+        if pruning_callback.pruned:
+            raise optuna.TrialPruned()
+
+        return pruning_callback.last_score
 
     pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=1)
     study = optuna.create_study(direction="maximize", pruner=pruner)

@@ -40,16 +40,16 @@ import numpy as np
 import mujoco
 import gymnasium as gym
 from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, CallbackList
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, CallbackList, BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize, sync_envs_normalization
 
 warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines3")
 
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "sweep"  # "sweep", "optuna", or "final"
+MODE = "optuna"  # "sweep", "optuna", or "final"
 
 SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0]
 SWEEP_STEPS = 900_000
@@ -459,22 +459,86 @@ def run_sweep(models_dir):
     print(f"Set WINNING_COT_WEIGHT = {best['cot_bonus_weight']} and MODE = 'final' to continue.")
 
 
+class OptunaPruningCallback(BaseCallback):
+    """Marathoner counterpart to the sprinter's version -- same fix for the
+    same WinError 1450 desktop-heap exhaustion caused by recreating a
+    SubprocVecEnv on every pruning check instead of once per trial. Scores
+    on CoT (minimize) with a hard survival gate, instead of velocity."""
+    def __init__(self, trial, eval_env, eval_freq, n_eval_episodes=3, unstable_penalty=1000.0, verbose=0):
+        super().__init__(verbose)
+        self.trial = trial
+        self.eval_env = eval_env
+        self.eval_freq = eval_freq
+        self.n_eval_episodes = n_eval_episodes
+        self.unstable_penalty = unstable_penalty
+        self.pruned = False
+        self.last_score = unstable_penalty
+        self._last_eval_step = 0
+
+    def _on_step(self):
+        if self.num_timesteps - self._last_eval_step >= self.eval_freq:
+            self._last_eval_step = self.num_timesteps
+            sync_envs_normalization(self.model.get_env(), self.eval_env)
+            result = evaluate_on_vec_env(self.model, self.eval_env, self.n_eval_episodes)
+            survived = result["mean_steps"] >= (LONG_EPISODE_STEPS - 1)
+            score = result["mean_cot"] if (survived and np.isfinite(result["mean_cot"])) \
+                else self.unstable_penalty
+            self.last_score = score
+            self.trial.report(score, self.num_timesteps)
+            if self.verbose >= 0:
+                print(f"[optuna trial {self.trial.number}] steps={self.num_timesteps:,} -> "
+                      f"CoT={result['mean_cot']:.3f}, survived={survived} "
+                      f"({result['mean_steps']:.0f}/{LONG_EPISODE_STEPS}), score={score:.3f}")
+            if self.trial.should_prune():
+                self.pruned = True
+                return False
+        return True
+
+
+def evaluate_on_vec_env(model, vec_env, n_episodes=3):
+    """Same rollout logic as quick_eval, operating on an already-built,
+    already-normalized vec_env so the pruning callback can reuse one
+    persistent env across many checks within a trial."""
+    velocities, powers, steps_list, cots = [], [], [], []
+    obs = vec_env.reset()
+    for _ in range(n_episodes):
+        done = False
+        step_count = 0
+        ep_v, ep_p, ep_cot = [], [], []
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done_arr, info = vec_env.step(action)
+            done = bool(done_arr[0])
+            step_count += 1
+            ep_v.append(info[0].get("forward_velocity", 0.0))
+            ep_p.append(info[0].get("mechanical_power_w", 0.0))
+            c = info[0].get("cost_of_transport", float("inf"))
+            if np.isfinite(c):
+                ep_cot.append(c)
+        velocities.append(float(np.mean(ep_v)))
+        powers.append(float(np.mean(ep_p)))
+        steps_list.append(step_count)
+        cots.append(float(np.mean(ep_cot)) if ep_cot else float("inf"))
+        obs = vec_env.reset()
+    return dict(
+        mean_velocity=float(np.mean(velocities)),
+        mean_power=float(np.mean(powers)),
+        mean_steps=float(np.mean(steps_list)),
+        mean_cot=float(np.mean(cots)) if all(np.isfinite(c) for c in cots) else float("inf"),
+    )
+
+
 def run_optuna_search(models_dir):
     """
     Optuna-driven joint search over cot_bonus_weight, power_weight,
     slip_weight, economy_weight, the effort caps, and core SAC
     hyperparameters -- with pruning intervals sized to the 3000-step
-    episode length (see OPTUNA_PRUNE_EVERY_STEPS comment above). This is
-    the marathoner counterpart to the sprinter's run_optuna_search.
+    episode length (see OPTUNA_PRUNE_EVERY_STEPS comment above).
 
     The objective directly minimizes CoT, but ONLY among trials that
     survive the full LONG_EPISODE_STEPS episode -- any trial that falls
     early gets a heavy fixed penalty (1000.0) regardless of how good its
-    CoT looked for however many steps it did survive. This closes the
-    exact failure mode that broke the manual sweep: a config that's very
-    efficient for a brief unsustainable burst must never be allowed to
-    look better than a config that's modestly efficient but genuinely
-    sustains the full distance.
+    CoT looked for however many steps it did survive.
     """
     try:
         import optuna
@@ -516,34 +580,45 @@ def run_optuna_search(models_dir):
         save_model_path = os.path.join(models_dir, tag)
         save_vecnorm_path = os.path.join(models_dir, f"vecnormalize_{tag}.pkl")
 
-        steps_done = 0
-        score = UNSTABLE_PENALTY
-        while steps_done < OPTUNA_TRIAL_STEPS:
-            chunk = min(OPTUNA_PRUNE_EVERY_STEPS, OPTUNA_TRIAL_STEPS - steps_done)
-            model = train_one_config(
-                env_id, kwargs, chunk, seed=0,
-                source_model_path=source_model_path if steps_done == 0 else save_model_path,
-                source_vecnorm_path=source_vecnorm_path if steps_done == 0 else save_vecnorm_path,
-                save_model_path=save_model_path, save_vecnorm_path=save_vecnorm_path,
-                models_dir=models_dir, tag=tag, max_episode_steps=LONG_EPISODE_STEPS,
-                hparams=hparams,
-            )
-            steps_done += chunk
+        cpu_count = os.cpu_count() or 8
+        n_envs = max(1, cpu_count - 2)
 
-            eval_result = quick_eval(model, save_vecnorm_path, kwargs, env_id, n_episodes=3,
-                                      max_episode_steps=LONG_EPISODE_STEPS)
-            survived = eval_result["mean_steps"] >= (LONG_EPISODE_STEPS - 1)
-            score = eval_result["mean_cot"] if (survived and np.isfinite(eval_result["mean_cot"])) \
-                else UNSTABLE_PENALTY
-            trial.report(score, steps_done)
-            print(f"[optuna trial {trial.number}] steps={steps_done:,} -> "
-                  f"CoT={eval_result['mean_cot']:.3f}, survived={survived} "
-                  f"({eval_result['mean_steps']:.0f}/{LONG_EPISODE_STEPS}), score={score:.3f}")
+        # Environments created ONCE per trial -- see OptunaPruningCallback
+        # docstring for why this matters on Windows.
+        vec_env_cls = SubprocVecEnv if n_envs > 1 else DummyVecEnv
+        train_env = make_vec_env(make_wrapped_env(env_id, kwargs, LONG_EPISODE_STEPS),
+                                  n_envs=n_envs, vec_env_cls=vec_env_cls, seed=0)
+        train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
-            if trial.should_prune():
-                raise optuna.TrialPruned()
+        eval_env = make_vec_env(make_wrapped_env(env_id, kwargs, LONG_EPISODE_STEPS),
+                                 n_envs=1, vec_env_cls=DummyVecEnv)
+        eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
 
-        return score
+        if os.path.exists(source_vecnorm_path):
+            train_env = VecNormalize.load(source_vecnorm_path, train_env.venv)
+            train_env.training = True
+            train_env.norm_reward = True
+
+        model = SAC.load(f"{source_model_path}.zip", env=train_env, device="cuda", seed=0)
+        model.ent_coef = "auto"
+        model = apply_hparam_overrides(model, hparams)
+
+        pruning_callback = OptunaPruningCallback(trial, eval_env, eval_freq=OPTUNA_PRUNE_EVERY_STEPS,
+                                                  unstable_penalty=UNSTABLE_PENALTY)
+
+        try:
+            model.learn(total_timesteps=OPTUNA_TRIAL_STEPS, callback=pruning_callback,
+                        reset_num_timesteps=False)
+        finally:
+            train_env.save(save_vecnorm_path)
+            model.save(f"{save_model_path}.zip")
+            train_env.close()
+            eval_env.close()
+
+        if pruning_callback.pruned:
+            raise optuna.TrialPruned()
+
+        return pruning_callback.last_score
 
     pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=1)
     study = optuna.create_study(direction="minimize", pruner=pruner)
