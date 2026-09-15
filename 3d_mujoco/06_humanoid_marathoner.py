@@ -49,13 +49,13 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "sweep"  # "sweep" or "final"
+MODE = "final"  # "sweep" or "final"
 
 SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0, 20.0, 28.0]
 SWEEP_STEPS = 300_000       # short budget per sweep candidate
 SWEEP_EVAL_EPISODES = 3
 
-WINNING_COT_WEIGHT = 14.0   # <-- set this from the sweep CSV before running MODE="final"
+WINNING_COT_WEIGHT = 28.0   # <-- set this from the sweep CSV before running MODE="final"
 FINAL_STEPS = 8_000_000
 FINAL_SEEDS = [0, 1, 2]     # best-of-N: train this many seeds, keep the lowest CoT
 
