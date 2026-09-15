@@ -36,7 +36,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "optuna"  # "sweep", "optuna", or "final"
+MODE = "final"  # "sweep", "optuna", or "final"
 
 SWEEP_SPEED_WEIGHTS = [2.0, 3.5, 5.0, 7.0, 10.0]
 SWEEP_STEPS = 300_000       # short budget per sweep candidate
@@ -54,8 +54,10 @@ OPTUNA_TRIAL_STEPS = 500_000   # per trial -- the flat 300k sweep undersold
 OPTUNA_PRUNE_EVERY_STEPS = 100_000
 
 WINNING_SPEED_WEIGHT = 5.0  # <-- set this from the sweep CSV before running MODE="final"
-WINNING_HPARAMS = None      # <-- set this from the Optuna study's best_trial.params instead,
-                             # if you ran MODE="optuna" (overrides WINNING_SPEED_WEIGHT)
+WINNING_HPARAMS = {'speed_weight': 13.705150422863579, 'max_power_cost': 4.850827554400599,
+                   'max_slip_cost': 2.5336864990971044, 'learning_rate': 0.00017231776055722254,
+                   'tau': 0.005030820797824174, 'gamma': 0.9859493712279521,
+                   'batch_size': 512, 'sde_sample_freq': 4}
 FINAL_STEPS = 8_000_000
 FINAL_SEEDS = [0, 1, 2]     # best-of-N: train this many seeds, keep the best
 # ============================================================================
