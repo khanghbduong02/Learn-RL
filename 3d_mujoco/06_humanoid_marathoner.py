@@ -49,7 +49,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "final"  # "sweep", "optuna", or "final"
+MODE = "optuna"  # "sweep", "optuna", or "final"
 
 SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0]
 SWEEP_STEPS = 900_000
@@ -621,7 +621,10 @@ def run_optuna_search(models_dir):
         return pruning_callback.last_score
 
     pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=1)
-    study = optuna.create_study(direction="minimize", pruner=pruner)
+    storage_path = f"sqlite:///{os.path.join(models_dir, 'marathoner_optuna.db')}"
+    study = optuna.create_study(direction="minimize", pruner=pruner, storage=storage_path,
+                                 study_name="marathoner_search", load_if_exists=True)
+    print(f"Study has {len(study.trials)} prior trial(s) on record before this run.")
     study.optimize(objective, n_trials=OPTUNA_TRIALS)
 
     print("\n=== Optuna search complete ===")
