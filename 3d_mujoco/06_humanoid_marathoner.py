@@ -49,7 +49,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "optuna"  # "sweep", "optuna", or "final"
+MODE = "final"  # "sweep", "optuna", or "final"
 
 SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0]
 SWEEP_STEPS = 900_000
@@ -75,7 +75,7 @@ OPTUNA_PRUNE_EVERY_STEPS = 300_000  # matches SWEEP_STEPS's cadence -- each
                                      # steps.
 
 WINNING_COT_WEIGHT = 9.0    # <-- set this from the sweep CSV before running MODE="final"
-WINNING_HPARAMS = {'cot_bonus_weight': 7.299659319347539, 'power_weight': 9.255467854903759e-05, 'slip_weight': 0.0008513862573760585, 'economy_weight': 0.002870181437670545, 'max_power_cost': 0.5889405756395547, 'max_slip_cost': 0.5480470928644386, 'learning_rate': 0.000261163559165115, 'tau': 0.0068315994474951085, 'gamma': 0.9832114294266351, 'batch_size': 256, 'sde_sample_freq': 4}
+WINNING_HPARAMS = {'cot_bonus_weight': 10.07387197847497, 'power_weight': 6.164107061878515e-05, 'slip_weight': 0.0005826221100052278, 'economy_weight': 0.08306810311505738, 'max_power_cost': 0.3416417784144945, 'max_slip_cost': 0.7720805899572344, 'learning_rate': 0.00018607001237577603, 'tau': 0.005690119062282096, 'gamma': 0.9953052846481253, 'batch_size': 128, 'sde_sample_freq': 4}
 FINAL_STEPS = 20_000_000
 FINAL_SEEDS = [0, 1, 2]     # best-of-N: train this many seeds, keep the lowest CoT
 
