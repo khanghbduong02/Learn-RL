@@ -36,7 +36,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "final"  # "sweep", "optuna", or "final"
+MODE = "optuna"  # "sweep", "optuna", or "final"
 
 SWEEP_SPEED_WEIGHTS = [2.0, 3.5, 5.0, 7.0, 10.0]
 SWEEP_STEPS = 300_000       # short budget per sweep candidate
@@ -690,6 +690,16 @@ def run_visual_test(best_model_path, stats_path, wrapper_kwargs, n_episodes=3):
             pass
 
 
+def run_visualize_only(models_dir):
+    """Just load the saved best sprinter and watch it, no training/search."""
+    model_path = os.path.join(models_dir, "sac_humanoid_sprinter")
+    vecnorm_path = os.path.join(models_dir, "vecnormalize_sprinter.pkl")
+    if not os.path.exists(f"{model_path}.zip"):
+        print(f"No saved best model found at '{model_path}.zip'. Run MODE='final' first.")
+        return
+    run_visual_test(model_path, vecnorm_path, BASE_KWARGS, n_episodes=3)
+
+
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     models_dir = os.path.abspath(os.path.join(script_dir, "..", "models"))
@@ -701,6 +711,8 @@ def main():
         run_optuna_search(models_dir)
     elif MODE == "final":
         run_final(models_dir)
+    elif MODE == "visualize":
+        run_visualize_only(models_dir)
     else:
         raise ValueError(f"Unknown MODE: {MODE}")
 

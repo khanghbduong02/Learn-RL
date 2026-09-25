@@ -75,7 +75,8 @@ OPTUNA_PRUNE_EVERY_STEPS = 300_000  # matches SWEEP_STEPS's cadence -- each
                                      # steps.
 
 WINNING_COT_WEIGHT = 9.0    # <-- set this from the sweep CSV before running MODE="final"
-WINNING_HPARAMS = {'cot_bonus_weight': 10.07387197847497, 'power_weight': 6.164107061878515e-05, 'slip_weight': 0.0005826221100052278, 'economy_weight': 0.08306810311505738, 'max_power_cost': 0.3416417784144945, 'max_slip_cost': 0.7720805899572344, 'learning_rate': 0.00018607001237577603, 'tau': 0.005690119062282096, 'gamma': 0.9953052846481253, 'batch_size': 128, 'sde_sample_freq': 4}
+# WINNING_HPARAMS = {'cot_bonus_weight': 10.07387197847497, 'power_weight': 6.164107061878515e-05, 'slip_weight': 0.0005826221100052278, 'economy_weight': 0.08306810311505738, 'max_power_cost': 0.3416417784144945, 'max_slip_cost': 0.7720805899572344, 'learning_rate': 0.00018607001237577603, 'tau': 0.005690119062282096, 'gamma': 0.9953052846481253, 'batch_size': 128, 'sde_sample_freq': 4}
+WINNING_HPARAMS = {'cot_bonus_weight': 10.07387197847497, 'power_weight': 6.164107061878515e-05, 'slip_weight': 0.0005826221100052278, 'economy_weight': 0.08306810311505738, 'max_power_cost': 0.3416417784144945, 'max_slip_cost': 0.7720805899572344}
 FINAL_STEPS = 20_000_000
 FINAL_SEEDS = [0, 1, 2]     # best-of-N: train this many seeds, keep the lowest CoT
 
@@ -768,6 +769,21 @@ def run_visual_test(best_model_path, stats_path, wrapper_kwargs, n_episodes=3):
             pass
 
 
+def run_visualize_only(models_dir):
+    """Just load the saved best marathoner and watch it, no training/search."""
+    model_path = os.path.join(models_dir, "sac_humanoid_marathoner")
+    vecnorm_path = os.path.join(models_dir, "vecnormalize_marathoner.pkl")
+    if not os.path.exists(f"{model_path}.zip"):
+        print(f"No saved best model found at '{model_path}.zip'. Run MODE='final' first.")
+        return
+    # cot_bonus_weight must be set >0 here purely so the CoT metric gets
+    # computed and printed -- it doesn't affect the already-trained policy's
+    # behavior at all (that's frozen), only whether run_visual_test's info
+    # dict has a real CoT value instead of permanent inf.
+    viz_kwargs = dict(BASE_KWARGS, cot_bonus_weight=WINNING_COT_WEIGHT)
+    run_visual_test(model_path, vecnorm_path, viz_kwargs, n_episodes=3)
+
+
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     models_dir = os.path.abspath(os.path.join(script_dir, "..", "models"))
@@ -779,6 +795,8 @@ def main():
         run_optuna_search(models_dir)
     elif MODE == "final":
         run_final(models_dir)
+    elif MODE == "visualize":
+        run_visualize_only(models_dir)
     else:
         raise ValueError(f"Unknown MODE: {MODE}")
 
