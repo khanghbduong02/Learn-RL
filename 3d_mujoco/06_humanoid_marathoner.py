@@ -49,7 +49,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "final"  # "sweep", "optuna", or "final"
+MODE = "final"  # "sweep", "optuna", "final", or "visualize"
 
 SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0]
 SWEEP_STEPS = 900_000
@@ -305,6 +305,23 @@ def quick_eval(model, stats_path, wrapper_kwargs, env_id="Humanoid-v5", n_episod
     )
 
 
+def reset_exploration(model, initial_value=1.0):
+    """Same fix as the sprinter script -- see that file's docstring for
+    the full explanation of why `model.ent_coef = "auto"` was a no-op."""
+    try:
+        import torch as th
+        device = model.device
+        model.log_ent_coef = th.nn.Parameter(
+            th.log(th.ones(1, device=device) * initial_value), requires_grad=True
+        )
+        model.ent_coef_optimizer = th.optim.Adam([model.log_ent_coef], lr=model.lr_schedule(1))
+        print(f"Exploration genuinely reset (log_ent_coef reinitialized to {initial_value}).")
+    except Exception as e:
+        print(f"WARNING: could not reset entropy internals ({e}). "
+              f"Exploration was NOT actually refreshed.")
+    return model
+
+
 def apply_hparam_overrides(model, hparams):
     """Same as the sprinter script's version -- see that file for full
     rationale on what's safely overridable post-load vs. not."""
@@ -361,7 +378,7 @@ def train_one_config(env_id, wrapper_kwargs, total_steps, seed, source_model_pat
             train_env.training = True
             train_env.norm_reward = True
         model = SAC.load(f"{source_model_path}.zip", env=train_env, device="cuda", seed=seed)
-        model.ent_coef = "auto"
+        model = reset_exploration(model)
         model = apply_hparam_overrides(model, hparams)
         reset_num_timesteps = False
     else:
@@ -601,7 +618,7 @@ def run_optuna_search(models_dir):
             train_env.norm_reward = True
 
         model = SAC.load(f"{source_model_path}.zip", env=train_env, device="cuda", seed=0)
-        model.ent_coef = "auto"
+        model = reset_exploration(model)
         model = apply_hparam_overrides(model, hparams)
 
         pruning_callback = OptunaPruningCallback(trial, eval_env, eval_freq=OPTUNA_PRUNE_EVERY_STEPS,

@@ -36,7 +36,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "optuna"  # "sweep", "optuna", or "final"
+MODE = "optuna"  # "sweep", "optuna", "final", or "visualize"
 
 SWEEP_SPEED_WEIGHTS = [2.0, 3.5, 5.0, 7.0, 10.0]
 SWEEP_STEPS = 300_000       # short budget per sweep candidate
@@ -252,6 +252,45 @@ def quick_eval(model, stats_path, wrapper_kwargs, env_id="Humanoid-v5", n_episod
     )
 
 
+def reset_exploration(model, initial_value=1.0):
+    """
+    Actually re-enables exploration after a warm-start load, unlike
+    `model.ent_coef = "auto"` (a no-op if ent_coef was already the string
+    "auto" on the loaded checkpoint -- which it always was here, since
+    every checkpoint in this project trains with ent_coef="auto"). SAC's
+    real exploration knob is the internal `log_ent_coef` torch parameter,
+    which IS fully restored from the checkpoint on load -- at whatever
+    fully-annealed, near-zero value the source training left it at. That
+    means every warm-start fine-tune in this project up to now started
+    with essentially zero real exploration noise, regardless of the
+    ent_coef line. This function creates a genuinely fresh log_ent_coef
+    parameter and optimizer, restoring real exploration pressure.
+
+    This directly explains failures where reward stays flat/bad for the
+    ENTIRE training run rather than improving then degrading later: with
+    near-zero exploration, the policy has no ability to search away from
+    wherever it landed right after the reward function changed.
+
+    Defensive: SB3's internal attribute names (log_ent_coef,
+    ent_coef_optimizer) are implementation details that could change
+    between versions. Falls back to a no-op with a warning if they're not
+    found, rather than crashing.
+    """
+    try:
+        import torch as th
+        device = model.device
+        model.log_ent_coef = th.nn.Parameter(
+            th.log(th.ones(1, device=device) * initial_value), requires_grad=True
+        )
+        model.ent_coef_optimizer = th.optim.Adam([model.log_ent_coef], lr=model.lr_schedule(1))
+        print(f"Exploration genuinely reset (log_ent_coef reinitialized to {initial_value}).")
+    except Exception as e:
+        print(f"WARNING: could not reset entropy internals ({e}). "
+              f"Exploration was NOT actually refreshed -- treat this fine-tune "
+              f"as starting from whatever exploration level the source checkpoint had.")
+    return model
+
+
 def apply_hparam_overrides(model, hparams):
     """
     Override mutable SAC hyperparameters on an already-loaded model.
@@ -320,7 +359,7 @@ def train_one_config(env_id, wrapper_kwargs, total_steps, seed, source_model_pat
             train_env.training = True
             train_env.norm_reward = True
         model = SAC.load(f"{source_model_path}.zip", env=train_env, device="cuda", seed=seed)
-        model.ent_coef = "auto"
+        model = reset_exploration(model)
         model = apply_hparam_overrides(model, hparams)
         reset_num_timesteps = False
     else:
@@ -541,7 +580,7 @@ def run_optuna_search(models_dir):
             train_env.norm_reward = True
 
         model = SAC.load(f"{source_model_path}.zip", env=train_env, device="cuda", seed=0)
-        model.ent_coef = "auto"
+        model = reset_exploration(model)
         model = apply_hparam_overrides(model, hparams)
 
         pruning_callback = OptunaPruningCallback(trial, eval_env, eval_freq=OPTUNA_PRUNE_EVERY_STEPS)
