@@ -49,7 +49,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "final"  # "sweep", "optuna", "final", or "visualize"
+MODE = "optuna"  # "sweep", "optuna", "final", or "visualize"
 
 SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0]
 SWEEP_STEPS = 900_000
@@ -75,8 +75,7 @@ OPTUNA_PRUNE_EVERY_STEPS = 300_000  # matches SWEEP_STEPS's cadence -- each
                                      # steps.
 
 WINNING_COT_WEIGHT = 9.0    # <-- set this from the sweep CSV before running MODE="final"
-# WINNING_HPARAMS = {'cot_bonus_weight': 10.07387197847497, 'power_weight': 6.164107061878515e-05, 'slip_weight': 0.0005826221100052278, 'economy_weight': 0.08306810311505738, 'max_power_cost': 0.3416417784144945, 'max_slip_cost': 0.7720805899572344, 'learning_rate': 0.00018607001237577603, 'tau': 0.005690119062282096, 'gamma': 0.9953052846481253, 'batch_size': 128, 'sde_sample_freq': 4}
-WINNING_HPARAMS = {'cot_bonus_weight': 10.07387197847497, 'power_weight': 6.164107061878515e-05, 'slip_weight': 0.0005826221100052278, 'economy_weight': 0.08306810311505738, 'max_power_cost': 0.3416417784144945, 'max_slip_cost': 0.7720805899572344}
+WINNING_HPARAMS = None      # <-- set this from the Optuna study's best_trial.params instead
 FINAL_STEPS = 20_000_000
 FINAL_SEEDS = [0, 1, 2]     # best-of-N: train this many seeds, keep the lowest CoT
 
@@ -481,7 +480,19 @@ class OptunaPruningCallback(BaseCallback):
     """Marathoner counterpart to the sprinter's version -- same fix for the
     same WinError 1450 desktop-heap exhaustion caused by recreating a
     SubprocVecEnv on every pruning check instead of once per trial. Scores
-    on CoT (minimize) with a hard survival gate, instead of velocity."""
+    on CoT (minimize) with a hard survival gate, instead of velocity.
+
+    IMPORTANT: requires survival on the last REQUIRED_CONSECUTIVE_SURVIVALS
+    checks, not just the latest one, before trusting a trial's CoT as a
+    real score. A single lucky-looking eval snapshot isn't enough evidence
+    -- this project has already seen a trial that survived transiently
+    during search but collapsed identically (~20 steps, negative velocity)
+    every time it was retrained to full convergence. Requiring consecutive
+    survival makes the search itself skeptical of exactly that failure
+    mode, instead of only catching it after an expensive full final run.
+    """
+    REQUIRED_CONSECUTIVE_SURVIVALS = 2
+
     def __init__(self, trial, eval_env, eval_freq, n_eval_episodes=3, unstable_penalty=1000.0, verbose=0):
         super().__init__(verbose)
         self.trial = trial
@@ -492,21 +503,25 @@ class OptunaPruningCallback(BaseCallback):
         self.pruned = False
         self.last_score = unstable_penalty
         self._last_eval_step = 0
+        self._survival_streak = 0
 
     def _on_step(self):
         if self.num_timesteps - self._last_eval_step >= self.eval_freq:
             self._last_eval_step = self.num_timesteps
             sync_envs_normalization(self.model.get_env(), self.eval_env)
             result = evaluate_on_vec_env(self.model, self.eval_env, self.n_eval_episodes)
-            survived = result["mean_steps"] >= (LONG_EPISODE_STEPS - 1)
-            score = result["mean_cot"] if (survived and np.isfinite(result["mean_cot"])) \
+            survived_this_check = result["mean_steps"] >= (LONG_EPISODE_STEPS - 1)
+            self._survival_streak = self._survival_streak + 1 if survived_this_check else 0
+            trustworthy = self._survival_streak >= self.REQUIRED_CONSECUTIVE_SURVIVALS
+            score = result["mean_cot"] if (trustworthy and np.isfinite(result["mean_cot"])) \
                 else self.unstable_penalty
             self.last_score = score
             self.trial.report(score, self.num_timesteps)
             if self.verbose >= 0:
                 print(f"[optuna trial {self.trial.number}] steps={self.num_timesteps:,} -> "
-                      f"CoT={result['mean_cot']:.3f}, survived={survived} "
-                      f"({result['mean_steps']:.0f}/{LONG_EPISODE_STEPS}), score={score:.3f}")
+                      f"CoT={result['mean_cot']:.3f}, survived_this_check={survived_this_check}, "
+                      f"streak={self._survival_streak}/{self.REQUIRED_CONSECUTIVE_SURVIVALS}, "
+                      f"score={score:.3f}")
             if self.trial.should_prune():
                 self.pruned = True
                 return False
@@ -576,12 +591,12 @@ def run_optuna_search(models_dir):
     UNSTABLE_PENALTY = 1000.0
 
     def objective(trial):
-        cot_bonus_weight = trial.suggest_float("cot_bonus_weight", 3.0, 16.0)
+        cot_bonus_weight = trial.suggest_float("cot_bonus_weight", 6.0, 12.0)
         power_weight = trial.suggest_float("power_weight", 0.00005, 0.0005, log=True)
-        slip_weight = trial.suggest_float("slip_weight", 0.0005, 0.002, log=True)
-        economy_weight = trial.suggest_float("economy_weight", 0.0, 0.15)
-        max_power_cost = trial.suggest_float("max_power_cost", 0.1, 1.0)
-        max_slip_cost = trial.suggest_float("max_slip_cost", 0.1, 1.0)
+        slip_weight = trial.suggest_float("slip_weight", 0.0008, 0.0015, log=True)
+        economy_weight = trial.suggest_float("economy_weight", 0.02, 0.06)
+        max_power_cost = trial.suggest_float("max_power_cost", 0.2, 0.5)
+        max_slip_cost = trial.suggest_float("max_slip_cost", 0.2, 0.4)
         learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-3, log=True)
         tau = trial.suggest_float("tau", 0.002, 0.02, log=True)
         gamma = trial.suggest_float("gamma", 0.98, 0.999)
