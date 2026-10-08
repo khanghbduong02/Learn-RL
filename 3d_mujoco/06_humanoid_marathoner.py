@@ -304,9 +304,22 @@ def quick_eval(model, stats_path, wrapper_kwargs, env_id="Humanoid-v5", n_episod
     )
 
 
-def reset_exploration(model, initial_value=1.0):
-    """Same fix as the sprinter script -- see that file's docstring for
-    the full explanation of why `model.ent_coef = "auto"` was a no-op."""
+# None = keep the entropy coefficient (alpha) inherited from the loaded
+# checkpoint -- what the one successful marathoner run (CoT=0.486) used.
+# Every run that reset alpha to 1.0 collapsed in ~20-26 steps. See the
+# sprinter script's reset_exploration docstring for the full reasoning.
+EXPLORATION_RESET_ALPHA = None
+
+
+def reset_exploration(model, initial_value=None):
+    """Optional entropy-coefficient overwrite; default OFF. Resetting alpha
+    to 1.0 on a converged policy (as an earlier version of this function
+    did) pushes it toward near-random behavior -- see the sprinter script."""
+    if initial_value is None:
+        initial_value = EXPLORATION_RESET_ALPHA
+    if initial_value is None:
+        print("Exploration: keeping the entropy coefficient inherited from the checkpoint.")
+        return model
     try:
         import torch as th
         device = model.device
@@ -314,10 +327,10 @@ def reset_exploration(model, initial_value=1.0):
             th.log(th.ones(1, device=device) * initial_value), requires_grad=True
         )
         model.ent_coef_optimizer = th.optim.Adam([model.log_ent_coef], lr=model.lr_schedule(1))
-        print(f"Exploration genuinely reset (log_ent_coef reinitialized to {initial_value}).")
+        print(f"Exploration reset: log_ent_coef reinitialized so alpha={initial_value}.")
     except Exception as e:
         print(f"WARNING: could not reset entropy internals ({e}). "
-              f"Exploration was NOT actually refreshed.")
+              f"Alpha is whatever the source checkpoint had.")
     return model
 
 
@@ -591,23 +604,30 @@ def run_optuna_search(models_dir):
     UNSTABLE_PENALTY = 1000.0
 
     def objective(trial):
+        # SAC hyperparameters (learning_rate, tau, gamma, batch_size,
+        # sde_sample_freq) are DELIBERATELY NOT searched here anymore.
+        # Two different Optuna-found hyperparameter sets both failed
+        # catastrophically at the full 20M-step scale -- one with
+        # aggressive reward weights, one with reward weights nearly
+        # identical to the validated-safe baseline -- while plain default
+        # hyperparameters have succeeded every time they've been tested.
+        # A 1.8M-step trial budget apparently cannot reliably predict
+        # whether a given hyperparameter combination stays stable once
+        # warm-started into this reward's much larger scale (cot_bonus
+        # here is 400x+ Stage 2's) and trained for 10x longer. Only the
+        # reward weights -- where we have a consistent, explainable track
+        # record -- are searched now.
         cot_bonus_weight = trial.suggest_float("cot_bonus_weight", 6.0, 12.0)
         power_weight = trial.suggest_float("power_weight", 0.00005, 0.0005, log=True)
         slip_weight = trial.suggest_float("slip_weight", 0.0008, 0.0015, log=True)
         economy_weight = trial.suggest_float("economy_weight", 0.02, 0.06)
         max_power_cost = trial.suggest_float("max_power_cost", 0.2, 0.5)
         max_slip_cost = trial.suggest_float("max_slip_cost", 0.2, 0.4)
-        learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-3, log=True)
-        tau = trial.suggest_float("tau", 0.002, 0.02, log=True)
-        gamma = trial.suggest_float("gamma", 0.98, 0.999)
-        batch_size = trial.suggest_categorical("batch_size", [128, 256, 512])
-        sde_sample_freq = trial.suggest_categorical("sde_sample_freq", [4, 8, 16])
 
         kwargs = dict(BASE_KWARGS, cot_bonus_weight=cot_bonus_weight, power_weight=power_weight,
                       slip_weight=slip_weight, economy_weight=economy_weight,
                       max_power_cost=max_power_cost, max_slip_cost=max_slip_cost)
-        hparams = dict(learning_rate=learning_rate, tau=tau, gamma=gamma,
-                        batch_size=batch_size, sde_sample_freq=sde_sample_freq)
+        hparams = None  # always use default SAC hyperparameters, see note above
 
         tag = f"optuna_trial{trial.number}"
         save_model_path = os.path.join(models_dir, tag)

@@ -252,30 +252,47 @@ def quick_eval(model, stats_path, wrapper_kwargs, env_id="Humanoid-v5", n_episod
     )
 
 
-def reset_exploration(model, initial_value=1.0):
-    """
-    Actually re-enables exploration after a warm-start load, unlike
-    `model.ent_coef = "auto"` (a no-op if ent_coef was already the string
-    "auto" on the loaded checkpoint -- which it always was here, since
-    every checkpoint in this project trains with ent_coef="auto"). SAC's
-    real exploration knob is the internal `log_ent_coef` torch parameter,
-    which IS fully restored from the checkpoint on load -- at whatever
-    fully-annealed, near-zero value the source training left it at. That
-    means every warm-start fine-tune in this project up to now started
-    with essentially zero real exploration noise, regardless of the
-    ent_coef line. This function creates a genuinely fresh log_ent_coef
-    parameter and optimizer, restoring real exploration pressure.
+# None = keep the entropy coefficient (alpha) inherited from the loaded
+# checkpoint. EVERY successful run in this project (sprinter 4.2 -> 4.68 ->
+# 5.22 m/s, marathoner CoT=0.486) used the inherited alpha. Every run that
+# set alpha back to 1.0 collapsed to a ~20-26 step random-looking failure.
+# Only set a float here (try something small, like 0.01) as a deliberate,
+# isolated experiment -- never alongside other changes.
+EXPLORATION_RESET_ALPHA = None
 
-    This directly explains failures where reward stays flat/bad for the
-    ENTIRE training run rather than improving then degrading later: with
-    near-zero exploration, the policy has no ability to search away from
-    wherever it landed right after the reward function changed.
+
+def reset_exploration(model, initial_value=None):
+    """
+    Optionally overwrite SAC's entropy coefficient after a warm-start load.
+
+    Background: `model.ent_coef = "auto"` (what this project used originally)
+    is a no-op -- ent_coef is already "auto" on a loaded checkpoint, and the
+    real knob, the internal `log_ent_coef` parameter, is restored from the
+    checkpoint at its annealed value (~0.0005 for Stage 2). That part of
+    the diagnosis was correct.
+
+    What turned out to be wrong was the remedy: resetting alpha to 1.0
+    (SAC's from-scratch initial value) on an already-converged policy. At
+    alpha=1.0 the entropy bonus rivals the (normalized) reward, so the
+    actor is pushed toward near-random behavior, and alpha only decays once
+    entropy overshoots its target -- so the policy degrades long before it
+    can recover. The signature matches what was observed: every run with
+    the reset died in ~20-26 steps with near-zero/negative velocity and
+    high, erratic power -- what a near-random humanoid looks like -- even
+    when reward weights were nearly identical to the validated config.
+    The only successful marathoner run predates this reset.
+
+    Default is therefore OFF (initial_value=None -> keep inherited alpha).
 
     Defensive: SB3's internal attribute names (log_ent_coef,
-    ent_coef_optimizer) are implementation details that could change
-    between versions. Falls back to a no-op with a warning if they're not
-    found, rather than crashing.
+    ent_coef_optimizer) are implementation details; falls back to a no-op
+    with a warning if they're not found.
     """
+    if initial_value is None:
+        initial_value = EXPLORATION_RESET_ALPHA
+    if initial_value is None:
+        print("Exploration: keeping the entropy coefficient inherited from the checkpoint.")
+        return model
     try:
         import torch as th
         device = model.device
@@ -283,11 +300,10 @@ def reset_exploration(model, initial_value=1.0):
             th.log(th.ones(1, device=device) * initial_value), requires_grad=True
         )
         model.ent_coef_optimizer = th.optim.Adam([model.log_ent_coef], lr=model.lr_schedule(1))
-        print(f"Exploration genuinely reset (log_ent_coef reinitialized to {initial_value}).")
+        print(f"Exploration reset: log_ent_coef reinitialized so alpha={initial_value}.")
     except Exception as e:
         print(f"WARNING: could not reset entropy internals ({e}). "
-              f"Exploration was NOT actually refreshed -- treat this fine-tune "
-              f"as starting from whatever exploration level the source checkpoint had.")
+              f"Alpha is whatever the source checkpoint had.")
     return model
 
 
