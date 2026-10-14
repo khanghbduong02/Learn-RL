@@ -49,7 +49,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines
 GRAVITY = 9.81
 
 # ============================================================================
-MODE = "optuna"  # "sweep", "optuna", "final", or "visualize"
+MODE = "recover"  # "sweep", "optuna", "final", "visualize", or "recover"
 
 SWEEP_COT_WEIGHTS = [5.0, 9.0, 14.0]
 SWEEP_STEPS = 900_000
@@ -756,13 +756,47 @@ def run_final(models_dir):
               "trusting an unstable result.")
         return
 
-    print(f"\nBest seed: {best_seed} -> CoT={best_score:.3f}")
+    print(f"\nBest eligible seed: {best_seed} -> CoT={best_score:.3f}")
     final_model_path = os.path.join(models_dir, "sac_humanoid_marathoner")
     final_vecnorm_path = os.path.join(models_dir, "vecnormalize_marathoner.pkl")
     import shutil
-    shutil.copy(f"{best_model[0]}.zip", f"{final_model_path}.zip")
-    shutil.copy(best_model[1], final_vecnorm_path)
-    print(f"Best marathoner saved as '{final_model_path}.zip'")
+
+    # Only replace the saved marathoner if the candidate has a LOWER CoT than
+    # it (re-evaluated now, under identical conditions). Previously any seed
+    # that merely survived would overwrite the saved model, even a worse one.
+    promote = True
+    if os.path.exists(f"{final_model_path}.zip"):
+        try:
+            existing = SAC.load(f"{final_model_path}.zip", device="cuda")
+            ev = quick_eval(existing, final_vecnorm_path, kwargs, env_id, n_episodes=5,
+                            max_episode_steps=LONG_EPISODE_STEPS)
+            existing_stable = ev["mean_steps"] >= (LONG_EPISODE_STEPS - 1)
+            print(f"Existing saved marathoner: CoT={ev['mean_cot']:.3f} "
+                  f"(survived full episode: {existing_stable})")
+            if existing_stable and np.isfinite(ev["mean_cot"]) and ev["mean_cot"] <= best_score:
+                print(f"New candidate (CoT={best_score:.3f}) does not beat the existing model "
+                      f"-- keeping the existing one. Candidate remains at '{best_model[0]}.zip'.")
+                promote = False
+        except Exception as e:
+            print(f"Could not evaluate the existing model ({e}); backing it up and promoting.")
+        if promote:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            shutil.copy(f"{final_model_path}.zip",
+                        os.path.join(models_dir, f"sac_humanoid_marathoner_backup_{stamp}.zip"))
+            if os.path.exists(final_vecnorm_path):
+                shutil.copy(final_vecnorm_path,
+                            os.path.join(models_dir, f"vecnormalize_marathoner_backup_{stamp}.pkl"))
+            if os.path.exists(f"{final_model_path}_config.json"):
+                shutil.copy(f"{final_model_path}_config.json",
+                            os.path.join(models_dir, f"sac_humanoid_marathoner_backup_{stamp}_config.json"))
+            print(f"Previous best backed up with timestamp {stamp}.")
+    if promote:
+        shutil.copy(f"{best_model[0]}.zip", f"{final_model_path}.zip")
+        shutil.copy(best_model[1], final_vecnorm_path)
+        write_config_sidecar(final_model_path, kwargs, sac_hparams,
+                             dict(seed=best_seed, final_steps=FINAL_STEPS, cot=best_score,
+                                  episode_steps=LONG_EPISODE_STEPS))
+        print(f"New best marathoner saved as '{final_model_path}.zip' (CoT={best_score:.3f})")
 
     run_visual_test(final_model_path, final_vecnorm_path, kwargs, n_episodes=3)
 
@@ -821,6 +855,95 @@ def run_visual_test(best_model_path, stats_path, wrapper_kwargs, n_episodes=3):
             pass
 
 
+def write_config_sidecar(model_path, kwargs, sac_hparams, extra=None):
+    """Write the exact config next to a saved model so 'what produced this
+    model?' never has to be reconstructed from memory again."""
+    import json
+    payload = dict(wrapper_kwargs=kwargs, sac_hparam_overrides=sac_hparams, extra=extra or {})
+    with open(f"{model_path}_config.json", "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+
+def run_recover_config(models_dir):
+    """
+    READ-ONLY. Looks through everything on disk that could reveal which
+    configuration produced the saved marathoner, and prints it. Nothing is
+    trained, loaded onto the GPU, or modified.
+    """
+    import json
+    import zipfile
+    import datetime
+
+    def mtime(path):
+        return datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
+
+    print("=== 0. Sidecar config (only exists for models promoted by newer runs) ===")
+    side = os.path.join(models_dir, "sac_humanoid_marathoner_config.json")
+    print(open(side).read() if os.path.exists(side) else "not found")
+
+    print("\n=== 1. Sweep results (marathoner_sweep_results.csv) ===")
+    p = os.path.join(models_dir, "marathoner_sweep_results.csv")
+    if os.path.exists(p):
+        print(f"(modified {mtime(p)})")
+        print(open(p).read())
+    else:
+        print("not found")
+
+    print("=== 2. Optuna results CSV (marathoner_optuna_results.csv) ===")
+    p = os.path.join(models_dir, "marathoner_optuna_results.csv")
+    if os.path.exists(p):
+        print(f"(modified {mtime(p)})")
+        with open(p) as f:
+            rows = [r for r in csv.DictReader(f) if r.get("value") not in (None, "")]
+        rows.sort(key=lambda r: float(r["value"]))
+        print(f"{len(rows)} completed trials. Lowest values (lower CoT = better; 1000 = unstable):")
+        for r in rows[:8]:
+            print("  ", dict(r))
+    else:
+        print("not found")
+
+    print("\n=== 3. Optuna study database (marathoner_optuna.db) ===")
+    db = os.path.join(models_dir, "marathoner_optuna.db")
+    if os.path.exists(db):
+        print(f"(modified {mtime(db)})")
+        try:
+            import optuna
+            study = optuna.load_study(study_name="marathoner_search", storage=f"sqlite:///{db}")
+            done = sorted([t for t in study.trials if t.value is not None], key=lambda t: t.value)
+            print(f"{len(done)} completed trials. Lowest values:")
+            for t in done[:8]:
+                print(f"   trial #{t.number}  value={t.value:.4f}  params={t.params}")
+        except Exception as e:
+            print(f"could not read it: {e}")
+    else:
+        print("not found (deleted, or never created)")
+
+    print("\n=== 4. Hyperparameters stored INSIDE the saved model ===")
+    zp = os.path.join(models_dir, "sac_humanoid_marathoner.zip")
+    if os.path.exists(zp):
+        print(f"(model file modified {mtime(zp)})")
+        try:
+            with zipfile.ZipFile(zp) as z:
+                data = json.loads(z.read("data").decode())
+            for k in ["learning_rate", "tau", "gamma", "batch_size", "buffer_size",
+                      "sde_sample_freq", "use_sde", "gradient_steps", "train_freq",
+                      "ent_coef", "target_entropy", "num_timesteps"]:
+                v = str(data.get(k))
+                print(f"   {k}: {v[:110]}")
+            print("   (defaults used by Stage 2: lr=0.0003, tau=0.005, gamma=0.99, batch_size=256, sde_sample_freq=4)")
+        except Exception as e:
+            print(f"could not read it: {e}")
+    else:
+        print("sac_humanoid_marathoner.zip not found")
+
+    print("\n=== 5. Related files on disk, oldest first (helps match timestamps) ===")
+    names = [n for n in os.listdir(models_dir)
+             if n.startswith(("marathoner", "sac_humanoid_marathoner", "vecnormalize_marathoner",
+                              "optuna_trial", "marathon_sweep"))]
+    for n in sorted(names, key=lambda n: os.path.getmtime(os.path.join(models_dir, n)))[:60]:
+        print(f"   {mtime(os.path.join(models_dir, n))}  {n}")
+
+
 def run_visualize_only(models_dir):
     """Just load the saved best marathoner and watch it, no training/search."""
     model_path = os.path.join(models_dir, "sac_humanoid_marathoner")
@@ -849,6 +972,8 @@ def main():
         run_final(models_dir)
     elif MODE == "visualize":
         run_visualize_only(models_dir)
+    elif MODE == "recover":
+        run_recover_config(models_dir)
     else:
         raise ValueError(f"Unknown MODE: {MODE}")
 

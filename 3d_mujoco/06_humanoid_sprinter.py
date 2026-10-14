@@ -57,6 +57,12 @@ WINNING_SPEED_WEIGHT = 5.0  # <-- set this from the sweep CSV before running MOD
 WINNING_HPARAMS = {'speed_weight': 9.72359820074549, 'max_power_cost': 1.2710673565857569, 'max_slip_cost': 4.812169992862976, 'learning_rate': 0.00020265896791413703, 'tau': 0.00296568654666933, 'gamma': 0.9803763007350198, 'batch_size': 512, 'sde_sample_freq': 4}
 FINAL_STEPS = 8_000_000
 FINAL_SEEDS = [0, 1, 2]     # best-of-N: train this many seeds, keep the best
+FINAL_SOURCE = "stage2"     # "stage2": every final run restarts from the Stage-2 checkpoint
+                             # (what produced 4.68 and 5.22 m/s).
+                             # "best": continue training FROM the saved best sprinter, so
+                             # progress compounds instead of being re-derived from scratch.
+                             # Either way the saved best is only replaced if the new
+                             # candidate is genuinely faster AND survives the full episode.
 # ============================================================================
 
 
@@ -641,10 +647,72 @@ def run_optuna_search(models_dir):
     print("\nSet WINNING_HPARAMS = " + str(study.best_trial.params) + " and MODE = 'final' to continue.")
 
 
+def write_config_sidecar(model_path, kwargs, sac_hparams, extra=None):
+    """Write the exact config next to a saved model so 'what produced this
+    model?' never has to be reconstructed from memory again."""
+    import json
+    payload = dict(wrapper_kwargs=kwargs, sac_hparam_overrides=sac_hparams, extra=extra or {})
+    with open(f"{model_path}_config.json", "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+
+def promote_if_better(models_dir, new_model_path, new_vecnorm_path, new_velocity, kwargs,
+                      env_id="Humanoid-v5", sac_hparams=None, extra=None):
+    """
+    Replace the saved best sprinter ONLY if the new candidate is faster than
+    it. The existing model is re-evaluated under identical conditions rather
+    than trusting a remembered number, and is backed up (timestamped) before
+    any replacement. Previously run_final overwrote the saved best
+    unconditionally, so a weaker or less stable final run could silently
+    destroy a better result.
+    """
+    import shutil
+    final_model_path = os.path.join(models_dir, "sac_humanoid_sprinter")
+    final_vecnorm_path = os.path.join(models_dir, "vecnormalize_sprinter.pkl")
+
+    if os.path.exists(f"{final_model_path}.zip"):
+        try:
+            existing = SAC.load(f"{final_model_path}.zip", device="cuda")
+            ev = quick_eval(existing, final_vecnorm_path, kwargs, env_id, n_episodes=5)
+            existing_stable = ev["mean_steps"] >= 999
+            print(f"Existing saved sprinter: {ev['mean_velocity']:.2f} m/s "
+                  f"(survived full episode: {existing_stable})")
+            if existing_stable and ev["mean_velocity"] >= new_velocity:
+                print(f"New candidate ({new_velocity:.2f} m/s) does not beat the existing "
+                      f"model -- keeping the existing one. The candidate is still saved at "
+                      f"'{new_model_path}.zip'.")
+                return False
+        except Exception as e:
+            print(f"Could not evaluate the existing model ({e}); backing it up and "
+                  f"promoting the new candidate.")
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        shutil.copy(f"{final_model_path}.zip",
+                    os.path.join(models_dir, f"sac_humanoid_sprinter_backup_{stamp}.zip"))
+        if os.path.exists(final_vecnorm_path):
+            shutil.copy(final_vecnorm_path,
+                        os.path.join(models_dir, f"vecnormalize_sprinter_backup_{stamp}.pkl"))
+        if os.path.exists(f"{final_model_path}_config.json"):
+            shutil.copy(f"{final_model_path}_config.json",
+                        os.path.join(models_dir, f"sac_humanoid_sprinter_backup_{stamp}_config.json"))
+        print(f"Previous best backed up with timestamp {stamp}.")
+
+    shutil.copy(f"{new_model_path}.zip", f"{final_model_path}.zip")
+    shutil.copy(new_vecnorm_path, final_vecnorm_path)
+    write_config_sidecar(final_model_path, kwargs, sac_hparams, extra)
+    print(f"New best sprinter saved as '{final_model_path}.zip' ({new_velocity:.2f} m/s)")
+    return True
+
+
 def run_final(models_dir):
     env_id = "Humanoid-v5"
-    source_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
-    source_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
+    if FINAL_SOURCE == "best" and os.path.exists(os.path.join(models_dir, "sac_humanoid_sprinter.zip")):
+        source_model_path = os.path.join(models_dir, "sac_humanoid_sprinter")
+        source_vecnorm_path = os.path.join(models_dir, "vecnormalize_sprinter.pkl")
+        print("Final run will CONTINUE from the saved best sprinter.")
+    else:
+        source_model_path = os.path.join(models_dir, "sac_humanoid_stage2")
+        source_vecnorm_path = os.path.join(models_dir, "vecnormalize_stage2.pkl")
+        print("Final run will start from the Stage-2 checkpoint.")
 
     if WINNING_HPARAMS is not None:
         # Optuna path: WINNING_HPARAMS contains speed_weight plus SAC
@@ -676,23 +744,33 @@ def run_final(models_dir):
             models_dir=models_dir, tag=tag, hparams=sac_hparams,
         )
         eval_result = quick_eval(model, save_vecnorm_path, kwargs, env_id, n_episodes=5)
+        survived = eval_result["mean_steps"] >= 999
         print(f"[final] seed={seed} -> velocity={eval_result['mean_velocity']:.2f} m/s, "
-              f"power={eval_result['mean_power']:.1f} W")
+              f"power={eval_result['mean_power']:.1f} W, "
+              f"steps={eval_result['mean_steps']:.0f}/1000, survived={survived}")
 
-        if eval_result["mean_velocity"] > best_score:
+        # A seed must survive the full episode to be eligible -- a policy that
+        # dives forward fast and falls must never beat one that actually runs.
+        if survived and eval_result["mean_velocity"] > best_score:
             best_score = eval_result["mean_velocity"]
             best_model = (save_model_path, save_vecnorm_path)
             best_seed = seed
 
-    print(f"\nBest seed: {best_seed} -> {best_score:.2f} m/s")
     final_model_path = os.path.join(models_dir, "sac_humanoid_sprinter")
     final_vecnorm_path = os.path.join(models_dir, "vecnormalize_sprinter.pkl")
-    import shutil
-    shutil.copy(f"{best_model[0]}.zip", f"{final_model_path}.zip")
-    shutil.copy(best_model[1], final_vecnorm_path)
-    print(f"Best sprinter saved as '{final_model_path}.zip'")
 
-    run_visual_test(final_model_path, final_vecnorm_path, kwargs, n_episodes=3)
+    if best_model is None:
+        print("\nWARNING: no seed survived the full episode. Nothing was promoted; "
+              "your saved best sprinter is untouched.")
+    else:
+        print(f"\nBest eligible seed: {best_seed} -> {best_score:.2f} m/s")
+        promote_if_better(models_dir, best_model[0], best_model[1], best_score, kwargs, env_id,
+                          sac_hparams=sac_hparams,
+                          extra=dict(seed=best_seed, final_steps=FINAL_STEPS, source=FINAL_SOURCE,
+                                     velocity=best_score))
+
+    if os.path.exists(f"{final_model_path}.zip"):
+        run_visual_test(final_model_path, final_vecnorm_path, kwargs, n_episodes=3)
 
 
 def run_visual_test(best_model_path, stats_path, wrapper_kwargs, n_episodes=3):
